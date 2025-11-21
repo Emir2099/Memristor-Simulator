@@ -1,5 +1,5 @@
 use memristor_sim::*;
-use std::io::{self, Write};
+use std::io;
 
 fn main() -> io::Result<()> {
     // Build a sample network:
@@ -7,9 +7,9 @@ fn main() -> io::Result<()> {
 
     let r1 = Component::R(Resistor { id: "R1".into(), r: 1e3 });
 
-    let m1 = Component::M(Memristor { id: "M1".into(), ron: 100.0, roff: 16000.0, state: 0.1, k: 1e3 });
+    let m1 = Component::M(Memristor { id: "M1".into(), ron: 100.0, roff: 16000.0, state: 0.1, mu: 1e3, window_p: 1.0, ithreshold: 0.0 });
     let r2 = Component::R(Resistor { id: "R2".into(), r: 2e3 });
-    let m2 = Component::M(Memristor { id: "M2".into(), ron: 100.0, roff: 16000.0, state: 0.5, k: 1e3 });
+    let m2 = Component::M(Memristor { id: "M2".into(), ron: 100.0, roff: 16000.0, state: 0.5, mu: 1e3, window_p: 1.0, ithreshold: 0.0 });
 
     let branch = Component::Series(vec![r2, m2]);
     let parallel = Component::Parallel(vec![m1, branch]);

@@ -12,7 +12,12 @@ pub struct Memristor {
     pub ron: f64,
     pub roff: f64,
     pub state: f64, // between 0..1
-    pub k: f64,     // state change per current unit (simple linear model)
+    // mobility-like parameter (controls rate of state change)
+    pub mu: f64,
+    // window exponent for boundary enforcement (Joglekar-like window)
+    pub window_p: f64,
+    // current threshold below which state doesn't change
+    pub ithreshold: f64,
 }
 
 #[derive(Clone)]
@@ -48,14 +53,17 @@ impl Memristor {
     }
 
     pub fn update_state(&mut self, current: f64, dt: f64) {
-        // simple linear drift: state' = k * i
-        self.state += self.k * current * dt;
-        if self.state > 1.0 {
-            self.state = 1.0;
+        // Nonlinear drift with a window function to slow state change near boundaries.
+        // Use a Joglekar-like window f(x) = 1 - (2x-1)^(2*p)
+        if current.abs() < self.ithreshold {
+            return;
         }
-        if self.state < 0.0 {
-            self.state = 0.0;
-        }
+        let s = self.state.clamp(0.0, 1.0);
+        let two_x_m1 = 2.0 * s - 1.0;
+        let f_win = 1.0 - two_x_m1.abs().powf(2.0 * self.window_p);
+        // state derivative proportional to current, mobility-like factor, and window
+        let ds = self.mu * current * f_win * dt;
+        self.state = (self.state + ds).clamp(0.0, 1.0);
     }
 }
 
