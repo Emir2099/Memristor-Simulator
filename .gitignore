@@ -32,3 +32,4 @@ Thumbs.db
 # Misc
 .env
 node_modules/
+output.csv
