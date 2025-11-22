@@ -7,3 +7,4 @@ edition = "2021"
 nalgebra = "0.34"
 eframe = "0.24"
 winapi = { version = "0.3", features = ["winuser", "windef"] }
+rfd = "0.11"
