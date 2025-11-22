@@ -236,6 +236,16 @@ impl Netlist {
             }
         }
 
+        // Update stored capacitor previous-voltages so C/dt companion sources are correct
+        for (ci, comp) in self.comps.iter().enumerate() {
+            if let Component::Capacitor { n1, n2, .. } = comp {
+                let v1 = if *n1 == 0 { 0.0 } else { node_voltages[*n1] };
+                let v2 = if *n2 == 0 { 0.0 } else { node_voltages[*n2] };
+                let vprev = v1 - v2;
+                self.cap_vprev.insert(ci, vprev);
+            }
+        }
+
         Some(MnaResult { node_voltages, vs_currents })
     }
 }
