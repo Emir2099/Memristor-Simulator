@@ -1,21 +1,28 @@
-use eframe::egui;
-use std::sync::mpsc::{channel, Receiver};
+﻿use eframe::egui;
+use std::sync::mpsc::{channel, Receiver, TryRecvError};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::thread;
 
 struct App {
-    // simulation parameters
     tstop: f64,
     dt: f64,
-    // state
     running: bool,
-    // receiver for background thread result
-    rx: Option<Receiver<String>>,
-    // latest CSV output
-    csv: String,
-    // parsed series for plotting (time, node2 voltage)
+    rx: Option<Receiver<(f64, f64, f64)>>,
+    cancel: Option<Arc<AtomicBool>>,
     times: Vec<f64>,
     node2: Vec<f64>,
     m1_state: Vec<f64>,
+    // params
+    mem_ron: f64,
+    mem_roff: f64,
+    mem_state_init: f64,
+    mem_mu0: f64,
+    mem_n: f64,
+    mem_window_p: f64,
+    mem_ithreshold: f64,
+    drive_is_sine: bool,
+    drive_amp: f64,
+    drive_freq: f64,
 }
 
 impl Default for App {
@@ -25,78 +32,75 @@ impl Default for App {
             dt: 1e-6,
             running: false,
             rx: None,
-            csv: String::new(),
+            cancel: None,
             times: Vec::new(),
             node2: Vec::new(),
             m1_state: Vec::new(),
+            mem_ron: 100.0,
+            mem_roff: 16000.0,
+            mem_state_init: 0.1,
+            mem_mu0: 1e3,
+            mem_n: 1.0,
+            mem_window_p: 1.0,
+            mem_ithreshold: 0.0,
+            drive_is_sine: false,
+            drive_amp: 1.0,
+            drive_freq: 1000.0,
         }
     }
 }
 
 impl App {
     fn start_sim(&mut self) {
-        if self.running {
-            return;
-        }
+        if self.running { return; }
         self.running = true;
-        self.csv.clear();
-        self.times.clear();
-        self.node2.clear();
-        self.m1_state.clear();
+        self.times.clear(); self.node2.clear(); self.m1_state.clear();
 
         let tstop = self.tstop;
         let dt = self.dt;
-
-        let (tx, rx) = channel();
+        let (tx, rx) = channel::<(f64, f64, f64)>();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
         self.rx = Some(rx);
+        self.cancel = Some(cancel_flag.clone());
+
+        let mem_templ = memristor_sim::Memristor {
+            id: "M1".into(), ron: self.mem_ron, roff: self.mem_roff,
+            state: self.mem_state_init, mu0: self.mem_mu0, n: self.mem_n,
+            window_p: self.mem_window_p, ithreshold: self.mem_ithreshold,
+            activation_e: 0.6, temperature: 300.0
+        };
+        let vs_kind = if self.drive_is_sine {
+            memristor_sim::mna::VoltageKind::Sine { amp: self.drive_amp, freq: self.drive_freq, phase: 0.0 }
+        } else {
+            memristor_sim::mna::VoltageKind::DC(self.drive_amp)
+        };
 
         thread::spawn(move || {
-            // run simulator in background
-            let csv = memristor_sim::run_mna_example_csv(tstop, dt);
-            // send CSV back to UI thread
-            let _ = tx.send(csv);
+            memristor_sim::run_mna_stream(tstop, dt, tx, cancel_flag, mem_templ, vs_kind);
         });
     }
 
-    fn try_collect_result(&mut self) {
+    fn try_collect_stream(&mut self) {
         if let Some(rx) = &self.rx {
-            match rx.try_recv() {
-                Ok(csv) => {
-                    self.csv = csv;
-                    self.parse_csv_for_plot();
-                    self.running = false;
-                    self.rx = None;
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    // still running
-                }
-                Err(_) => {
-                    self.running = false;
-                    self.rx = None;
-                }
-            }
-        }
-    }
-
-    fn parse_csv_for_plot(&mut self) {
-        self.times.clear();
-        self.node2.clear();
-        self.m1_state.clear();
-
-        for (i, line) in self.csv.lines().enumerate() {
-            if i == 0 { continue; } // skip header
-            let parts: Vec<&str> = line.split(',').collect();
-            if parts.len() >= 5 {
-                if let (Ok(t), Ok(_n0), Ok(_n1), Ok(n2), Ok(s)) = (
-                    parts[0].parse::<f64>(),
-                    parts[1].parse::<f64>(),
-                    parts[2].parse::<f64>(),
-                    parts[3].parse::<f64>(),
-                    parts[4].parse::<f64>(),
-                ) {
-                    self.times.push(t);
-                    self.node2.push(n2);
-                    self.m1_state.push(s);
+            loop {
+                match rx.try_recv() {
+                    Ok((t, v2, s)) => {
+                        if v2.is_finite() && s.is_finite() {
+                            self.times.push(t);
+                            self.node2.push(v2);
+                            self.m1_state.push(s);
+                        }
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        let n = self.times.len();
+                        let (t_first, t_last) = if n >= 1 { (self.times.first().copied().unwrap_or(0.0), self.times.last().copied().unwrap_or(0.0)) } else { (0.0, 0.0) };
+                        let (v_first, v_last) = if n >= 1 { (self.node2.first().copied().unwrap_or(0.0), self.node2.last().copied().unwrap_or(0.0)) } else { (0.0, 0.0) };
+                        let v_min = self.node2.iter().cloned().fold(f64::INFINITY, f64::min);
+                        let v_max = self.node2.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                        println!("[sim debug] stream disconnected: samples={} t_first={:.9} t_last={:.9} v_first={:.9e} v_last={:.9e} v_min={:.9e} v_max={:.9e}", n, t_first, t_last, v_first, v_last, v_min, v_max);
+                        self.running = false; self.rx = None; self.cancel = None; break;
+                    }
                 }
             }
         }
@@ -105,33 +109,23 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // poll for background result
-        self.try_collect_result();
+        self.try_collect_stream();
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Memristor Simulator (native GUI)");
 
             ui.horizontal(|ui| {
-                ui.label("tstop (s):");
-                ui.add(egui::DragValue::new(&mut self.tstop).speed(1e-6));
-                ui.label("dt (s):");
-                ui.add(egui::DragValue::new(&mut self.dt).speed(1e-7));
-                if ui.add_enabled(!self.running, egui::Button::new("Run")).clicked() {
-                    self.start_sim();
-                }
+                ui.label("tstop (s):"); ui.add(egui::DragValue::new(&mut self.tstop).speed(1e-6));
+                ui.label("dt (s):"); ui.add(egui::DragValue::new(&mut self.dt).speed(1e-7));
+                if ui.add_enabled(!self.running, egui::Button::new("Run")).clicked() { self.start_sim(); }
                 if ui.add_enabled(self.running, egui::Button::new("Stop")).clicked() {
-                    // stopping thread gracefully isn't implemented; just mark as not running
-                    // TODO: add cancellation support in simulator
-                    self.running = false;
-                    self.rx = None;
+                    if let Some(cancel) = &self.cancel { cancel.store(true, Ordering::Relaxed); }
                 }
                 if ui.button("Save CSV").clicked() {
-                    if !self.csv.is_empty() {
-                        if let Some(path) = rfd::FileDialog::new().save_file() {
-                            if let Err(e) = std::fs::write(&path, &self.csv) {
-                                eprintln!("Failed to save CSV: {}", e);
-                            }
-                        }
+                    if !self.times.is_empty() {
+                        let mut s = String::new(); s.push_str("time,node_2,M1_state\n");
+                        for i in 0..self.times.len() { s.push_str(&format!("{:.9},{:.6e},{:.6}\n", self.times[i], self.node2[i], self.m1_state[i])); }
+                        if let Some(path) = rfd::FileDialog::new().save_file() { let _ = std::fs::write(&path, &s); }
                     }
                 }
             });
@@ -139,89 +133,87 @@ impl eframe::App for App {
             ui.separator();
 
             ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.label(format!("Status: {}", if self.running { "Running..." } else { "Idle" }));
-                    ui.label(format!("Samples: {}", self.times.len()));
-                    egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
-                        ui.monospace(if self.csv.len() > 2000 { &self.csv[..2000] } else { &self.csv });
-                    });
-                });
-
-                // improved plotting area using painter: background, grid, axes, two traces
-                let (rect, _resp) = ui.allocate_exact_size(egui::vec2(700.0, 360.0), egui::Sense::hover());
-                // dark plot background to make lines visible
-                ui.painter().rect_filled(rect, 0.0, egui::Color32::from_rgb(24, 26, 30));
-
-                if self.times.is_empty() {
-                    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "No data yet", egui::FontId::proportional(18.0), egui::Color32::LIGHT_GRAY);
-                } else {
-                    let t_min = *self.times.first().unwrap_or(&0.0);
-                    let t_max = *self.times.last().unwrap_or(&1.0);
-                    let v_min = self.node2.iter().cloned().fold(f64::INFINITY, f64::min);
-                    let v_max = self.node2.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                    let v_min = if v_min.is_finite() { v_min } else { 0.0 };
-                    let v_max = if v_max.is_finite() { v_max } else { 1.0 };
-                    let v_range = (v_max - v_min).max(1e-12);
-                    let t_range = (t_max - t_min).max(1e-12);
-
-                    // draw grid lines (5 vertical, 4 horizontal)
-                    for i in 0..=5 {
-                        let fx = i as f32 / 5.0;
-                        let x = rect.left() + fx * rect.width();
-                        ui.painter().line_segment([egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())], egui::Stroke::new(1.0, egui::Color32::from_rgb(50,50,55)));
-                    }
-                    for i in 0..=4 {
-                        let fy = i as f32 / 4.0;
-                        let y = rect.top() + fy * rect.height();
-                        ui.painter().line_segment([egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)], egui::Stroke::new(1.0, egui::Color32::from_rgb(50,50,55)));
-                    }
-
-                    // draw node2 trace (bright cyan)
-                    if self.times.len() > 1 {
-                        let mut points: Vec<egui::Pos2> = Vec::with_capacity(self.times.len());
-                        for (t, v) in self.times.iter().zip(self.node2.iter()) {
-                            let fx = ((*t - t_min) / t_range) as f32;
-                            let fy = ((*v - v_min) / v_range) as f32;
-                            let x = rect.left() + fx * rect.width();
-                            let y = rect.bottom() - fy * rect.height();
-                            points.push(egui::pos2(x, y));
-                        }
-                        ui.painter().add(egui::Shape::line(points.clone(), egui::Stroke::new(2.5, egui::Color32::from_rgb(0, 200, 255))));
-                    }
-
-                    // draw M1 state trace (orange) on secondary axis normalized 0..1
-                    if self.times.len() > 1 && !self.m1_state.is_empty() {
-                        let mut state_points: Vec<egui::Pos2> = Vec::with_capacity(self.m1_state.len());
-                        for (t, s) in self.times.iter().zip(self.m1_state.iter()) {
-                            let fx = ((*t - t_min) / t_range) as f32;
-                            let fy = *s as f32; // states already 0..1
-                            let x = rect.left() + fx * rect.width();
-                            // map state to lower part of plot (e.g., bottom 25%) so it doesn't overlap voltage
-                            let y = rect.bottom() - (0.2 * fy) * rect.height();
-                            state_points.push(egui::pos2(x, y));
-                        }
-                        ui.painter().add(egui::Shape::line(state_points.clone(), egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 165, 0))));
-                    }
-
-                    // axes labels and ticks
-                    let label_color = egui::Color32::LIGHT_GRAY;
-                    ui.painter().text(rect.left_top() + egui::vec2(6.0, 6.0), egui::Align2::LEFT_TOP, "node_2 (V)", egui::FontId::proportional(14.0), label_color);
-                    ui.painter().text(rect.right_bottom() - egui::vec2(60.0, 20.0), egui::Align2::LEFT_BOTTOM, format!("t [{:.3}..{:.3}]s", t_min, t_max), egui::FontId::proportional(12.0), label_color);
-                    // legend
-                    let legend_pos = rect.left_top() + egui::vec2(8.0, 28.0);
-                    let legend_rect = egui::Rect::from_min_size(legend_pos, egui::vec2(140.0, 20.0));
-                    ui.painter().rect_filled(legend_rect, egui::Rounding::same(4.0), egui::Color32::from_rgba_unmultiplied(10,10,10,180));
-                    ui.painter().text(legend_pos + egui::vec2(6.0, 2.0), egui::Align2::LEFT_TOP, "● node_2", egui::FontId::proportional(12.0), egui::Color32::from_rgb(0,200,255));
-                    ui.painter().text(legend_pos + egui::vec2(86.0, 2.0), egui::Align2::LEFT_TOP, "● M1_state", egui::FontId::proportional(12.0), egui::Color32::from_rgb(255,165,0));
+                ui.label(format!("Status: {}", if self.running { "Running..." } else { "Idle" }));
+                ui.label(""); ui.label(format!("Samples: {}", self.times.len()));
+                if self.times.len() >= 2 {
+                    let first = self.times.first().copied().unwrap_or(0.0);
+                    let last = self.times.last().copied().unwrap_or(0.0);
+                    let rate = (self.times.len() - 1) as f64 / (last - first).max(1e-12);
+                    ui.label(format!("{:.0} sps", rate));
                 }
-                // border
-                ui.painter().rect_stroke(rect, 2.0, egui::Stroke::new(1.0, egui::Color32::from_rgb(80,80,90)));
             });
+
+            let progress = if let Some(&t) = self.times.last() { (t / self.tstop).clamp(0.0, 1.0) as f32 } else { 0.0f32 };
+            ui.add(egui::ProgressBar::new(progress).text(format!("{:.1}%", (progress as f64) * 100.0)));
+
+            ui.separator();
+
+            ui.push_id("last_samples", |ui| {
+                ui.label("Last samples (time, node_2, state):");
+                egui::ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
+                    let n = self.times.len();
+                    let start = if n > 8 { n - 8 } else { 0 };
+                    for i in start..n { ui.label(format!("{:.6}\t{:.6e}\t{:.6}", self.times[i], self.node2[i], self.m1_state[i])); }
+                    if n == 0 { ui.label("(no samples yet)"); }
+                });
+            });
+
+            ui.separator();
+
+            let width = ui.available_size().x.max(320.0);
+            let height = 360.0_f32;
+            let (rect, _resp) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+            ui.painter().rect_filled(rect, 0.0, egui::Color32::from_rgb(24,26,30));
+
+            if self.times.is_empty() {
+                ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "No data yet", egui::FontId::proportional(18.0), egui::Color32::LIGHT_GRAY);
+            } else {
+                let t_min = *self.times.first().unwrap_or(&0.0);
+                let t_max = *self.times.last().unwrap_or(&1.0);
+                let mut v_min = self.node2.iter().cloned().fold(f64::INFINITY, f64::min);
+                let mut v_max = self.node2.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                if !v_min.is_finite() || !v_max.is_finite() { v_min = 0.0; v_max = 1.0; }
+                let orig_span = v_max - v_min;
+                if orig_span.abs() < 1e-12 { let m = (v_max.abs().max(1.0)) * 1e-3; v_min -= m; v_max += m; } else { let span = v_max - v_min; v_min -= 0.06 * span; v_max += 0.06 * span; }
+                let v_range = (v_max - v_min).max(1e-9);
+                let t_range = (t_max - t_min).max(1e-12);
+
+                for i in 0..=4 { let fx = i as f32 / 4.0; let x = rect.left() + fx * rect.width(); ui.painter().line_segment([egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())], egui::Stroke::new(1.0, egui::Color32::from_rgb(50,50,55))); }
+
+                let mut pts: Vec<egui::Pos2> = Vec::with_capacity(self.times.len());
+                for (t, v) in self.times.iter().zip(self.node2.iter()) {
+                    let fx = ((*t - t_min) / t_range) as f32;
+                    let fy = ((*v - v_min) / v_range) as f32;
+                    let x = rect.left() + fx * rect.width();
+                    let y = rect.bottom() - fy * rect.height();
+                    pts.push(egui::pos2(x,y));
+                }
+                if pts.len() > 1 { ui.painter().add(egui::Shape::line(pts.clone(), egui::Stroke::new(3.0, egui::Color32::from_rgb(0,200,255)))); }
+                for p in pts.iter().step_by((pts.len()/120).max(1)) { ui.painter().circle_filled(*p, 3.0, egui::Color32::from_rgb(0,200,255)); }
+                if let (Some(f), Some(l)) = (pts.first(), pts.last()) { ui.painter().circle_filled(*f, 6.0, egui::Color32::from_rgb(0,255,0)); ui.painter().circle_filled(*l, 6.0, egui::Color32::from_rgb(255,0,0)); }
+
+                // If original data span was essentially flat, draw an emphasized horizontal line and bigger markers
+                if orig_span.abs() < 1e-9 {
+                    if let Some(&v0) = self.node2.first() {
+                        let fy0 = ((v0 - v_min) / v_range) as f32;
+                        let y0 = rect.bottom() - fy0 * rect.height();
+                        ui.painter().line_segment([egui::pos2(rect.left(), y0), egui::pos2(rect.right(), y0)], egui::Stroke::new(4.0, egui::Color32::from_rgb(255,200,0)));
+                        // big markers every Nth
+                        for p in pts.iter().step_by((pts.len()/40).max(1)) { ui.painter().circle_filled(*p, 6.0, egui::Color32::from_rgb(255,200,0)); }
+                    }
+                }
+
+                let dbg_show = 12usize.min(self.times.len()); let mut y_off = rect.top() + 8.0;
+                for i in 0..dbg_show { let line = format!("{:.6}: {:.6e} st={:.3}", self.times[i], self.node2[i], self.m1_state[i]); ui.painter().text(rect.left_top() + egui::vec2(8.0, y_off - rect.top()), egui::Align2::LEFT_TOP, line, egui::FontId::proportional(12.0), egui::Color32::from_rgba_unmultiplied(220,220,220,230)); y_off += 14.0; }
+
+            ui.painter().text(rect.right_top() - egui::vec2(8.0, -4.0), egui::Align2::RIGHT_TOP, format!("max={:.6}", v_max), egui::FontId::proportional(12.0), egui::Color32::LIGHT_GRAY);
+            ui.painter().text(rect.right_bottom() - egui::vec2(8.0, 18.0), egui::Align2::RIGHT_BOTTOM, format!("min={:.6}", v_min), egui::FontId::proportional(12.0), egui::Color32::LIGHT_GRAY);
+            }
+
+            ui.painter().rect_stroke(rect, 2.0, egui::Stroke::new(1.0, egui::Color32::from_rgb(80,80,90)));
         });
-        // request repaint while running to animate status
-        if self.running {
-            ctx.request_repaint_after(std::time::Duration::from_millis(100));
-        }
+
+        if self.running { ctx.request_repaint_after(std::time::Duration::from_millis(100)); }
     }
 }
 

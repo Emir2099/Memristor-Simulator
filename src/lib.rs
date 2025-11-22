@@ -273,3 +273,52 @@ pub fn run_mna_example_csv(tstop: f64, dt: f64) -> String {
 
     s
 }
+
+// Stream MNA example results incrementally. Sends tuples (time, node2_voltage, m1_state)
+// over the provided sender. The function checks `cancel` periodically and returns early
+// if cancellation is requested. Caller should handle channel closure as completion.
+pub fn run_mna_stream(
+    tstop: f64,
+    dt: f64,
+    tx: std::sync::mpsc::Sender<(f64, f64, f64)>,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    mem_template: Memristor,
+    vs_kind: crate::mna::VoltageKind,
+) {
+    use crate::mna;
+
+    let mut net = mna::Netlist::new();
+    net.add(mna::Component::Resistor { id: "R1".into(), n1: 1, n2: 0, r: 1e3 });
+    let mut mem = mem_template.clone();
+    mem.id = "M1".into();
+    net.add(mna::Component::Memristor { id: "M1".into(), n1: 2, n2: 0, mem });
+    net.add(mna::Component::Resistor { id: "R2".into(), n1: 1, n2: 2, r: 2e3 });
+    net.add(mna::Component::VSource { id: "V1".into(), n_plus: 1, n_minus: 0, kind: vs_kind });
+
+    // compute a stable integer step count to avoid cumulative floating-point error
+    let steps_f = (tstop / dt).floor();
+    let steps = if steps_f.is_finite() && steps_f >= 0.0 { steps_f as usize } else { 0 };
+    // iterate 0..=steps and ensure final sample time equals tstop
+    for i in 0..=steps {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+        let t = if i == steps { tstop } else { (i as f64) * dt };
+
+        if let Some(res) = net.solve(t, dt) {
+            let v2 = res.node_voltages.get(2).copied().unwrap_or(0.0);
+            // find M1 state
+            let mut m1_state = 0.0;
+            for c in &net.comps {
+                if let mna::Component::Memristor { id, mem, .. } = c {
+                    if id == "M1" { m1_state = mem.state; }
+                }
+            }
+            // ignore send errors (receiver dropped)
+            let _ = tx.send((t, v2, m1_state));
+        } else {
+            // send NaNs on error
+            let _ = tx.send((t, f64::NAN, f64::NAN));
+        }
+    }
+}
