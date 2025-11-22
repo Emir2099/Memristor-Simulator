@@ -1,4 +1,5 @@
 ﻿use eframe::egui;
+use memristor_sim::node_graph::{Graph, NodeKind};
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::thread;
@@ -23,6 +24,10 @@ struct App {
     drive_is_sine: bool,
     drive_amp: f64,
     drive_freq: f64,
+    // simple in-app graph editor state
+    graph: Graph,
+    link_from: usize,
+    link_to: usize,
 }
 
 impl Default for App {
@@ -46,6 +51,9 @@ impl Default for App {
             drive_is_sine: false,
             drive_amp: 1.0,
             drive_freq: 1000.0,
+            graph: Graph::default(),
+            link_from: 0,
+            link_to: 0,
         }
     }
 }
@@ -77,6 +85,23 @@ impl App {
 
         thread::spawn(move || {
             memristor_sim::run_mna_stream(tstop, dt, tx, cancel_flag, mem_templ, vs_kind);
+        });
+    }
+
+    fn start_sim_from_netlist(&mut self, net: memristor_sim::mna::Netlist, monitor_node: usize, mem_id: String) {
+        if self.running { return; }
+        self.running = true;
+        self.times.clear(); self.node2.clear(); self.m1_state.clear();
+
+        let tstop = self.tstop;
+        let dt = self.dt;
+        let (tx, rx) = std::sync::mpsc::channel::<(f64, f64, f64)>();
+        let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.rx = Some(rx);
+        self.cancel = Some(cancel_flag.clone());
+
+        thread::spawn(move || {
+            memristor_sim::run_mna_stream_from_netlist(net, monitor_node, mem_id, tstop, dt, tx, cancel_flag);
         });
     }
 
@@ -164,6 +189,43 @@ impl eframe::App for App {
             ui.label("Memristor params:");
             ui.add(egui::DragValue::new(&mut self.mem_ron)); ui.label("ron");
             ui.add(egui::DragValue::new(&mut self.mem_roff)); ui.label("roff");
+
+            ui.separator();
+            ui.label("Node Graph (simple):");
+            ui.horizontal(|ui| {
+                if ui.button("Add Memristor").clicked() {
+                    self.graph.add_node(NodeKind::Memristor { id: format!("m{}", self.graph.nodes.len()), ron: self.mem_ron, roff: self.mem_roff, state: self.mem_state_init, mu0: self.mem_mu0, n: self.mem_n, window_p: self.mem_window_p, ithreshold: self.mem_ithreshold });
+                }
+                if ui.button("Add VSource").clicked() {
+                    self.graph.add_node(NodeKind::VSource { id: format!("v{}", self.graph.nodes.len()), amp: self.drive_amp, freq: self.drive_freq, is_sine: self.drive_is_sine });
+                }
+            });
+
+            ui.label("Nodes:");
+            for n in &self.graph.nodes { ui.label(format!("{}: {:?}", n.id, n.kind)); }
+
+            ui.label("Links:");
+            for l in &self.graph.links { ui.label(format!("{} -> {}", l.a, l.b)); }
+
+            ui.horizontal(|ui| {
+                ui.label("From idx:"); ui.add(egui::DragValue::new(&mut self.link_from).clamp_range(0..=100));
+                ui.label("To idx:"); ui.add(egui::DragValue::new(&mut self.link_to).clamp_range(0..=100));
+                if ui.button("Add Link").clicked() {
+                    if self.link_from < self.graph.nodes.len() && self.link_to < self.graph.nodes.len() {
+                        self.graph.add_link(self.link_from, self.link_to);
+                    }
+                }
+            });
+
+            ui.separator();
+            if ui.button("Build Netlist & Run").clicked() {
+                let net = self.graph.to_netlist();
+                // choose monitor node: prefer node 2 if exists (first mem), else 0
+                let monitor = if net.max_node >= 2 { 2 } else { 0 };
+                // default mem id M1
+                let mem_id = "M1".to_string();
+                self.start_sim_from_netlist(net, monitor, mem_id);
+            }
         });
 
         // Central: plot area

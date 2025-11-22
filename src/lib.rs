@@ -1,4 +1,5 @@
 use std::fmt;
+pub mod node_graph;
 
 #[derive(Clone)]
 pub struct Resistor {
@@ -319,6 +320,39 @@ pub fn run_mna_stream(
         } else {
             // send NaNs on error
             let _ = tx.send((t, f64::NAN, f64::NAN));
+        }
+    }
+}
+
+// Stream a provided Netlist incrementally. Sends tuples (time, monitored_node_voltage, mem_state)
+// `monitor_node` is the node index to sample (0..n_nodes-1). `mem_id` is the memristor id to report state for.
+pub fn run_mna_stream_from_netlist(
+    mut net: crate::mna::Netlist,
+    monitor_node: usize,
+    mem_id: String,
+    tstop: f64,
+    dt: f64,
+    tx: std::sync::mpsc::Sender<(f64, f64, f64)>,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    // compute a stable integer step count
+    let steps_f = (tstop / dt).floor();
+    let steps = if steps_f.is_finite() && steps_f >= 0.0 { steps_f as usize } else { 0 };
+    for i in 0..=steps {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) { break; }
+        let t = if i == steps { tstop } else { (i as f64) * dt };
+        if let Some(res) = net.solve(t, dt) {
+            let v_mon = res.node_voltages.get(monitor_node).copied().unwrap_or(0.0);
+            // find mem state with given id
+            let mut m_state = 0.0;
+            for c in &net.comps {
+                if let crate::mna::Component::Memristor { id, mem, .. } = c {
+                    if id == &mem_id { m_state = mem.state; }
+                }
+            }
+            let _ = tx.send((t, v_mon, m_state));
+        } else {
+            let _ = tx.send((if i==steps { tstop } else { (i as f64) * dt }, f64::NAN, f64::NAN));
         }
     }
 }
