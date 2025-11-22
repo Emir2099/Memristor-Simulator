@@ -1,45 +1,48 @@
-use memristor_sim::*;
+use memristor_sim::{mna, Memristor};
 use std::io;
+use std::fs::File;
+use std::io::Write;
 
 fn main() -> io::Result<()> {
-    // Build a sample network:
-    // top = Series( [ R(1k), Parallel( [ M1, Series([R2, M2]) ]) ])
+    // Build an MNA netlist example:
+    // Node numbering: 0 = ground, 1 = after R1, 2 = branch node
+    let mut net = mna::Netlist::new();
+    // R1 between node 1 and ground (1k)
+    net.add(mna::Component::Resistor { id: "R1".into(), n1: 1, n2: 0, r: 1e3 });
+    // Memristor M1 between node 2 and ground
+    net.add(mna::Component::Memristor { id: "M1".into(), n1: 2, n2: 0, mem: Memristor { id: "M1".into(), ron: 100.0, roff: 16000.0, state: 0.1, mu0: 1e3, n: 1.0, window_p: 1.0, ithreshold: 0.0, activation_e: 0.6, temperature: 300.0 } });
+    // Series branch: R2 (2k) between node1 and node2
+    net.add(mna::Component::Resistor { id: "R2".into(), n1: 1, n2: 2, r: 2e3 });
+    // Voltage source between node 0 and node 1 (drive across R1+branch)
+    net.add(mna::Component::VSource { id: "V1".into(), n_plus: 1, n_minus: 0, kind: mna::VoltageKind::DC(1.0) });
 
-    let r1 = Component::R(Resistor { id: "R1".into(), r: 1e3 });
+    // Prepare CSV file
+    let mut file = File::create("mna_output.csv")?;
+    // header: time, node_0, node_1, node_2, M1_state
+    writeln!(file, "time,node_0,node_1,node_2,M1_state")?;
 
-    let m1 = Component::M(Memristor { id: "M1".into(), ron: 100.0, roff: 16000.0, state: 0.1, mu: 1e3, window_p: 1.0, ithreshold: 0.0 });
-    let r2 = Component::R(Resistor { id: "R2".into(), r: 2e3 });
-    let m2 = Component::M(Memristor { id: "M2".into(), ron: 100.0, roff: 16000.0, state: 0.5, mu: 1e3, window_p: 1.0, ithreshold: 0.0 });
-
-    let branch = Component::Series(vec![r2, m2]);
-    let parallel = Component::Parallel(vec![m1, branch]);
-
-    let top = Component::Series(vec![r1, parallel]);
-
-    let mut sim = Simulator::new(top);
-
-    // drive: step to 1.0 V at t>=0
-    let drive = |_: f64| -> f64 { 1.0 };
-
-    let tstop = 1e-3; // 1 ms
-    let dt = 1e-6; // 1 us -> 1000 steps
-
-    // Print CSV header
-    println!("time,path,voltage,current,state");
-
+    let tstop = 1e-3;
+    let dt = 1e-6;
     let mut t = 0.0;
     while t <= tstop {
-        let v = drive(t);
-        sim.recorder.clear();
-        let _i = sim.top.step(v, dt, &mut sim.recorder, "top");
-
-        for s in &sim.recorder.samples {
-            println!("{:.9},{},{:.6e},{:.6e},{}", s.time, s.path, s.voltage, s.current, match s.state { Some(x) => format!("{:.6}", x), None => "".into() });
+        if let Some(res) = net.solve(t, dt) {
+            let v0 = res.node_voltages.get(0).copied().unwrap_or(0.0);
+            let v1 = res.node_voltages.get(1).copied().unwrap_or(0.0);
+            let v2 = res.node_voltages.get(2).copied().unwrap_or(0.0);
+            // find M1 state
+            let mut m1_state = 0.0;
+            for c in &net.comps {
+                if let mna::Component::Memristor { id, mem, .. } = c {
+                    if id == "M1" { m1_state = mem.state; }
+                }
+            }
+            writeln!(file, "{:.9},{:.6e},{:.6e},{:.6e},{:.6}", t, v0, v1, v2, m1_state)?;
+        } else {
+            writeln!(file, "{:.9},ERR,ERR,ERR,ERR", t)?;
         }
-
-        // advance time and keep memristor states updated (done in step)
         t += dt;
     }
 
+    println!("Wrote MNA simulation to mna_output.csv");
     Ok(())
 }

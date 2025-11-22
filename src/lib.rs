@@ -6,18 +6,24 @@ pub struct Resistor {
     pub r: f64,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Memristor {
     pub id: String,
     pub ron: f64,
     pub roff: f64,
     pub state: f64, // between 0..1
-    // mobility-like parameter (controls rate of state change)
-    pub mu: f64,
-    // window exponent for boundary enforcement (Joglekar-like window)
+    // base mobility-like prefactor (A^-1 s^-1)
+    pub mu0: f64,
+    // nonlinearity exponent on current (|i|-ith)^n
+    pub n: f64,
+    // window exponent for boundary enforcement
     pub window_p: f64,
     // current threshold below which state doesn't change
     pub ithreshold: f64,
+    // activation energy (eV) for temperature dependence (Arrhenius)
+    pub activation_e: f64,
+    // temperature in Kelvin
+    pub temperature: f64,
 }
 
 #[derive(Clone)]
@@ -53,17 +59,29 @@ impl Memristor {
     }
 
     pub fn update_state(&mut self, current: f64, dt: f64) {
-        // Nonlinear drift with a window function to slow state change near boundaries.
-        // Use a Joglekar-like window f(x) = 1 - (2x-1)^(2*p)
-        if current.abs() < self.ithreshold {
+        // Ionic drift model with nonlinear mobility and temperature dependence.
+        // If current below threshold, no change.
+        if current.abs() <= self.ithreshold {
             return;
         }
+
         let s = self.state.clamp(0.0, 1.0);
+        // Joglekar-like window to slow change near boundaries
         let two_x_m1 = 2.0 * s - 1.0;
         let f_win = 1.0 - two_x_m1.abs().powf(2.0 * self.window_p);
-        // state derivative proportional to current, mobility-like factor, and window
-        let ds = self.mu * current * f_win * dt;
-        self.state = (self.state + ds).clamp(0.0, 1.0);
+
+        // effective mobility (Arrhenius temperature dependence)
+        // k_B in eV/K is ~8.617333262145e-5
+        let k_b_ev = 8.617333262145e-5_f64;
+        let temp_factor = (-self.activation_e / (k_b_ev * self.temperature)).exp();
+
+        // nonlinear current dependence: (|i|-ith)^n * sign(i)
+        let i_eff = (current.abs() - self.ithreshold).max(0.0).powf(self.n) * current.signum();
+
+        // state derivative
+        let ds_dt = self.mu0 * temp_factor * i_eff * f_win;
+
+        self.state = (self.state + ds_dt * dt).clamp(0.0, 1.0);
     }
 }
 
@@ -210,4 +228,48 @@ impl Simulator {
             self.time = t;
         }
     }
+}
+
+pub mod mna;
+
+// Run a small MNA example (same netlist as `cli`) and return CSV as a String.
+// This is intended for in-process use (e.g. GUI) so we don't need to spawn the CLI binary.
+pub fn run_mna_example_csv(tstop: f64, dt: f64) -> String {
+    use crate::mna;
+
+    let mut net = mna::Netlist::new();
+    // R1 between node 1 and ground (1k)
+    net.add(mna::Component::Resistor { id: "R1".into(), n1: 1, n2: 0, r: 1e3 });
+    // Memristor M1 between node 2 and ground
+    net.add(mna::Component::Memristor { id: "M1".into(), n1: 2, n2: 0, mem: Memristor { id: "M1".into(), ron: 100.0, roff: 16000.0, state: 0.1, mu0: 1e3, n: 1.0, window_p: 1.0, ithreshold: 0.0, activation_e: 0.6, temperature: 300.0 } });
+    // Series branch: R2 (2k) between node1 and node2
+    net.add(mna::Component::Resistor { id: "R2".into(), n1: 1, n2: 2, r: 2e3 });
+    // Voltage source between node 0 and node 1 (drive across R1+branch)
+    net.add(mna::Component::VSource { id: "V1".into(), n_plus: 1, n_minus: 0, kind: mna::VoltageKind::DC(1.0) });
+
+    // build CSV in-memory
+    let mut s = String::new();
+    s.push_str("time,node_0,node_1,node_2,M1_state\n");
+
+    let mut t = 0.0;
+    while t <= tstop {
+        if let Some(res) = net.solve(t, dt) {
+            let v0 = res.node_voltages.get(0).copied().unwrap_or(0.0);
+            let v1 = res.node_voltages.get(1).copied().unwrap_or(0.0);
+            let v2 = res.node_voltages.get(2).copied().unwrap_or(0.0);
+            // find M1 state
+            let mut m1_state = 0.0;
+            for c in &net.comps {
+                if let mna::Component::Memristor { id, mem, .. } = c {
+                    if id == "M1" { m1_state = mem.state; }
+                }
+            }
+            s.push_str(&format!("{:.9},{:.6e},{:.6e},{:.6e},{:.6}\n", t, v0, v1, v2, m1_state));
+        } else {
+            s.push_str(&format!("{:.9},ERR,ERR,ERR,ERR\n", t));
+        }
+        t += dt;
+    }
+
+    s
 }
