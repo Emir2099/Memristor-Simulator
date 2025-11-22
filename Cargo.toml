@@ -5,6 +5,8 @@ edition = "2021"
 
 [dependencies]
 nalgebra = "0.34"
-eframe = "0.24"
+eframe = { version = "0.24", features = ["glow"] }
 winapi = { version = "0.3", features = ["winuser", "windef"] }
 rfd = "0.11"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

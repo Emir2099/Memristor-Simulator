@@ -1,26 +1,27 @@
 use std::collections::HashMap;
 use crate::mna;
+use serde::{Serialize, Deserialize};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum NodeKind {
     VSource { id: String, amp: f64, freq: f64, is_sine: bool },
     Memristor { id: String, ron: f64, roff: f64, state: f64, mu0: f64, n: f64, window_p: f64, ithreshold: f64 },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Node {
     pub id: usize,
     pub kind: NodeKind,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Link {
     // connect node_a.output -> node_b.input 
     pub a: usize,
     pub b: usize,
 }
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct Graph {
     pub nodes: Vec<Node>,
     pub links: Vec<Link>,
@@ -35,6 +36,28 @@ impl Graph {
 
     pub fn add_link(&mut self, a: usize, b: usize) {
         self.links.push(Link { a, b });
+    }
+
+    // Remove a node by index. This will remove any links referencing it and renumber subsequent node ids.
+    pub fn remove_node(&mut self, idx: usize) {
+        if idx >= self.nodes.len() { return; }
+        // remove the node
+        self.nodes.remove(idx);
+        // renumber node ids
+        for (i, n) in self.nodes.iter_mut().enumerate() { n.id = i; }
+        // remove links that reference the removed node
+        self.links.retain(|l| l.a != idx && l.b != idx);
+        // decrement indices greater than removed
+        for l in &mut self.links {
+            if l.a > idx { l.a -= 1; }
+            if l.b > idx { l.b -= 1; }
+        }
+    }
+
+    // Remove a link by index in the links vector
+    pub fn remove_link(&mut self, link_idx: usize) {
+        if link_idx >= self.links.len() { return; }
+        self.links.remove(link_idx);
     }
 
     // This implementation assumes a very small subset of workflows:
