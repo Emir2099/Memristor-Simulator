@@ -63,24 +63,16 @@ impl Graph {
         let mut net_map: HashMap<usize, usize> = HashMap::new();
         let mut next_net = 2usize; // reserve 1 for source node if present
 
-        if vs_node.is_some() {
-            net_map.insert(vs_node.unwrap(), 1);
+        if let Some(vs) = vs_node {
+            net_map.insert(vs, 1);
         }
 
-        // mem nodes get unique nets (unless linked to source)
+        // mem nodes always get unique nets (distinct from source). If a memristor is linked to the source
+        // we will connect it via a resistor (R2) rather than collapsing it into the same net.
         for n in &self.nodes {
-            match &n.kind {
-                NodeKind::Memristor { .. } => {
-                    // if linked from the source, map to same net as source (1) for its first terminal
-                    let linked_to_vs = self.links.iter().any(|l| (l.a == vs_node.unwrap_or(usize::MAX) && l.b == n.id) || (l.b == vs_node.unwrap_or(usize::MAX) && l.a == n.id));
-                    if linked_to_vs {
-                        net_map.insert(n.id, 1);
-                    } else {
-                        net_map.insert(n.id, next_net);
-                        next_net += 1;
-                    }
-                }
-                _ => {}
+            if let NodeKind::Memristor { .. } = &n.kind {
+                net_map.insert(n.id, next_net);
+                next_net += 1;
             }
         }
 
@@ -92,19 +84,20 @@ impl Graph {
             net.add(mna::Component::Resistor { id: "R1".into(), n1: 1, n2: 0, r: 1e3 });
         }
 
-        // Add memristors and R2 between source and mem node
+        // Add memristors and R2 between source and mem node (only if the mem node net differs from source)
         let mut mem_count = 0;
         for n in &self.nodes {
-            if let NodeKind::Memristor { id, ron, roff, state, mu0, n: expn, window_p, ithreshold } = &n.kind {
+            if let NodeKind::Memristor { id: _, ron, roff, state, mu0, n: expn, window_p, ithreshold } = &n.kind {
                 mem_count += 1;
                 let net_idx = *net_map.get(&n.id).unwrap_or(&0);
                 let mem_id = format!("M{}", mem_count);
                 net.add(mna::Component::Memristor { id: mem_id.clone(), n1: net_idx, n2: 0, mem: crate::Memristor { id: mem_id.clone(), ron: *ron, roff: *roff, state: *state, mu0: *mu0, n: *expn, window_p: *window_p, ithreshold: *ithreshold, activation_e: 0.6, temperature: 300.0 } });
-
-                // if there is a source, add R2 between source node (1) and this mem node
-                if vs_node.is_some() {
-                    let r2id = format!("R2_{}", mem_count);
-                    net.add(mna::Component::Resistor { id: r2id, n1: 1, n2: net_idx, r: 2e3 });
+                // if there is a source, add R2 between source node (1) and this mem node, but only if nets differ
+                if let Some(_) = vs_node {
+                    if net_idx != 1 {
+                        let r2id = format!("R2_{}", mem_count);
+                        net.add(mna::Component::Resistor { id: r2id, n1: 1, n2: net_idx, r: 2e3 });
+                    }
                 }
             }
         }
@@ -118,5 +111,24 @@ impl Graph {
         }
 
         net
+    }
+
+    // Return a textual preview of the netlist and simple validation warnings.
+    pub fn to_netlist_preview(&self) -> (String, Vec<String>) {
+        let net = self.to_netlist();
+        let mut s = String::new();
+        for c in &net.comps {
+            s.push_str(&format!("{}", c));
+        }
+        // simple validation: detect any resistor stamped between same node
+        let mut warnings = Vec::new();
+        for c in &net.comps {
+            if let mna::Component::Resistor { id, n1, n2, .. } = c {
+                if n1 == n2 {
+                    warnings.push(format!("Resistor {} has identical terminals ({} == {})", id, n1, n2));
+                }
+            }
+        }
+        (s, warnings)
     }
 }

@@ -28,6 +28,13 @@ struct App {
     graph: Graph,
     link_from: usize,
     link_to: usize,
+    // last generated netlist preview and options
+    last_net_preview: String,
+    last_net_warnings: Vec<String>,
+    last_net: Option<memristor_sim::mna::Netlist>,
+    monitor_node: usize,
+    mem_options: Vec<String>,
+    selected_mem_idx: usize,
 }
 
 impl Default for App {
@@ -54,6 +61,12 @@ impl Default for App {
             graph: Graph::default(),
             link_from: 0,
             link_to: 0,
+            last_net_preview: String::new(),
+            last_net_warnings: Vec::new(),
+            last_net: None,
+            monitor_node: 0,
+            mem_options: Vec::new(),
+            selected_mem_idx: 0,
         }
     }
 }
@@ -218,13 +231,61 @@ impl eframe::App for App {
             });
 
             ui.separator();
-            if ui.button("Build Netlist & Run").clicked() {
+            if ui.button("Build Netlist").clicked() {
+                let (preview, warnings) = self.graph.to_netlist_preview();
                 let net = self.graph.to_netlist();
-                // choose monitor node: prefer node 2 if exists (first mem), else 0
-                let monitor = if net.max_node >= 2 { 2 } else { 0 };
-                // default mem id M1
-                let mem_id = "M1".to_string();
-                self.start_sim_from_netlist(net, monitor, mem_id);
+                // populate mem options
+                let mut mems = Vec::new();
+                for c in &net.comps {
+                    if let memristor_sim::mna::Component::Memristor { id, .. } = c {
+                        mems.push(id.clone());
+                    }
+                }
+                self.mem_options = mems;
+                // choose default monitor node: first mem node if exists (node 2) else 0
+                self.monitor_node = if net.max_node >= 2 { 2 } else { 0 };
+                self.selected_mem_idx = 0;
+                self.last_net_preview = preview;
+                self.last_net_warnings = warnings;
+                self.last_net = Some(net);
+            }
+
+            if let Some(_) = &self.last_net {
+                ui.separator();
+                ui.label("Netlist preview:");
+                egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
+                    ui.code(&self.last_net_preview);
+                    if !self.last_net_warnings.is_empty() {
+                        ui.separator();
+                        for w in &self.last_net_warnings { ui.colored_label(egui::Color32::YELLOW, w); }
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Monitor node:");
+                    // simple numeric selector for monitor node
+                    ui.add(egui::DragValue::new(&mut self.monitor_node).clamp_range(0..=(self.last_net.as_ref().unwrap().max_node)));
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Memristor:");
+                    if self.mem_options.is_empty() {
+                        ui.label("(none)");
+                    } else {
+                        egui::ComboBox::from_id_source("mem_select").selected_text(self.mem_options[self.selected_mem_idx].clone()).show_ui(ui, |ui| {
+                            for (i, id) in self.mem_options.iter().enumerate() {
+                                ui.selectable_value(&mut self.selected_mem_idx, i, id);
+                            }
+                        });
+                    }
+                });
+
+                if ui.button("Run Netlist").clicked() {
+                    if let Some(net) = self.last_net.take() {
+                        let mem_id = if self.mem_options.is_empty() { "M1".to_string() } else { self.mem_options[self.selected_mem_idx].clone() };
+                        self.start_sim_from_netlist(net, self.monitor_node, mem_id);
+                    }
+                }
             }
         });
 
