@@ -1,5 +1,6 @@
 use std::fmt;
 pub mod node_graph;
+pub mod models;
 
 #[derive(Clone)]
 pub struct Resistor {
@@ -89,86 +90,31 @@ impl MemristorModel for HpTiO2Model {
     fn box_clone(&self) -> Box<dyn MemristorModel> { Box::new(self.clone()) }
 }
 
-// --- VTEAM model (voltage-threshold adaptive memristor) ---
+// Physics-backed model adapter: wraps a boxed `models::MemristorPhysics` and implements
+// the existing `MemristorModel` trait so the solver and other code do not need to change.
 #[derive(Clone)]
-pub struct VTeamModel {
+pub struct PhysicsBackedModel {
     pub id: String,
-    pub ron: f64,
-    pub roff: f64,
+    pub physics: Box<dyn crate::models::MemristorPhysics>,
     pub state: f64,
-    pub v_on: f64,
-    pub v_off: f64,
-    pub k_on: f64,
-    pub k_off: f64,
-    pub window_p: f64,
 }
 
-impl VTeamModel {
-    pub fn new(id: impl Into<String>, ron: f64, roff: f64, state: f64) -> Self {
-        VTeamModel { id: id.into(), ron, roff, state, v_on: 1.0, v_off: -1.0, k_on: 1e-3, k_off: 1e-3, window_p: 1.0 }
+impl PhysicsBackedModel {
+    pub fn new(id: impl Into<String>, physics: Box<dyn crate::models::MemristorPhysics>, state: f64) -> Self {
+        PhysicsBackedModel { id: id.into(), physics, state }
     }
 }
 
-impl MemristorModel for VTeamModel {
+impl MemristorModel for PhysicsBackedModel {
     fn id(&self) -> &str { &self.id }
     fn set_id(&mut self, id: String) { self.id = id; }
     fn state(&self) -> f64 { self.state }
-    fn set_state(&mut self, s: f64) { self.state = s.clamp(0.0,1.0); }
+    fn set_state(&mut self, s: f64) { self.state = self.physics.clip_state(s); }
     fn resistance(&self) -> f64 { self.resistance_for_state(self.state) }
-    fn resistance_for_state(&self, s: f64) -> f64 { let s = s.clamp(0.0,1.0); self.ron * s + self.roff * (1.0 - s) }
-    fn predict_state(&self, s_old: f64, vdrop: f64, _current: f64, dt: f64) -> f64 {
-        // VTEAM: state changes only when |v| crosses thresholds
-        let mut ds_dt = 0.0;
-        if vdrop > self.v_on {
-            ds_dt = self.k_on * (vdrop - self.v_on);
-        } else if vdrop < self.v_off {
-            ds_dt = self.k_off * (vdrop - self.v_off);
-        }
-        // window to slow at boundaries
-        let s = s_old.clamp(0.0,1.0);
-        let two_x_m1 = 2.0 * s - 1.0;
-        let f_win = 1.0 - two_x_m1.abs().powf(2.0 * self.window_p);
-        (s_old + ds_dt * f_win * dt).clamp(0.0, 1.0)
-    }
-    fn box_clone(&self) -> Box<dyn MemristorModel> { Box::new(self.clone()) }
-}
-
-// --- Yakopcic model (simplified variant) ---
-#[derive(Clone)]
-pub struct YakopcicModel {
-    pub id: String,
-    pub ron: f64,
-    pub roff: f64,
-    pub state: f64,
-    pub alpha_p: f64,
-    pub beta_p: f64,
-    pub alpha_n: f64,
-    pub beta_n: f64,
-    pub p: f64,
-}
-
-impl YakopcicModel {
-    pub fn new(id: impl Into<String>, ron: f64, roff: f64, state: f64) -> Self {
-        YakopcicModel { id: id.into(), ron, roff, state, alpha_p: 1e-3, beta_p: 1.0, alpha_n: 1e-3, beta_n: 1.0, p: 1.0 }
-    }
-}
-
-impl MemristorModel for YakopcicModel {
-    fn id(&self) -> &str { &self.id }
-    fn set_id(&mut self, id: String) { self.id = id; }
-    fn state(&self) -> f64 { self.state }
-    fn set_state(&mut self, s: f64) { self.state = s.clamp(0.0,1.0); }
-    fn resistance(&self) -> f64 { self.resistance_for_state(self.state) }
-    fn resistance_for_state(&self, s: f64) -> f64 { let s = s.clamp(0.0,1.0); self.ron * s + self.roff * (1.0 - s) }
-    fn predict_state(&self, s_old: f64, vdrop: f64, _current: f64, dt: f64) -> f64 {
-        // simplified Yakopcic-like dynamics: asymmetric sinh-based rates
-        let mut ds_dt = 0.0;
-        if vdrop > 0.0 {
-            ds_dt = self.alpha_p * (vdrop * self.beta_p).sinh() * (1.0 - s_old).powf(self.p);
-        } else if vdrop < 0.0 {
-            ds_dt = -self.alpha_n * ((-vdrop) * self.beta_n).sinh() * s_old.powf(self.p);
-        }
-        (s_old + ds_dt * dt).clamp(0.0, 1.0)
+    fn resistance_for_state(&self, s: f64) -> f64 { self.physics.resistance(self.physics.clip_state(s)) }
+    fn predict_state(&self, s_old: f64, vdrop: f64, current: f64, dt: f64) -> f64 {
+        let ds_dt = self.physics.derivative(s_old, vdrop, current);
+        self.physics.clip_state(s_old + ds_dt * dt)
     }
     fn box_clone(&self) -> Box<dyn MemristorModel> { Box::new(self.clone()) }
 }
@@ -352,8 +298,8 @@ impl Simulator {
             let v = drive(t);
             self.recorder.clear();
             // step the network with this voltage
-            let mut top = &mut self.top;
-            let current = top.step(v, dt, &mut self.recorder, "top");
+            let top = &mut self.top;
+            let _current = top.step(v, dt, &mut self.recorder, "top");
 
             // stamp time into recorded samples
             for s in &mut self.recorder.samples {

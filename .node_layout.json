@@ -23,7 +23,8 @@
             "mu0": 1000.0,
             "n": 1.0,
             "window_p": 1.0,
-            "ithreshold": 0.0
+            "ithreshold": 0.0,
+            "model": "HP"
           }
         }
       }

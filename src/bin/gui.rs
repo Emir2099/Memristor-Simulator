@@ -201,7 +201,7 @@ impl App {
         self.graph.add_node(NodeKind::VSource { id: "v0".into(), amp: self.drive_amp, freq: self.drive_freq, is_sine: self.drive_is_sine });
         self.node_positions.push([40.0, 40.0]);
         // add memristor at idx 1
-        self.graph.add_node(NodeKind::Memristor { id: "m0".into(), ron: self.mem_ron, roff: self.mem_roff, state: self.mem_state_init, mu0: self.mem_mu0, n: self.mem_n, window_p: self.mem_window_p, ithreshold: self.mem_ithreshold });
+        self.graph.add_node(NodeKind::Memristor { id: "m0".into(), ron: self.mem_ron, roff: self.mem_roff, state: self.mem_state_init, mu0: self.mem_mu0, n: self.mem_n, window_p: self.mem_window_p, ithreshold: self.mem_ithreshold, model: "HP".into() });
         self.node_positions.push([220.0, 40.0]);
         // add link 0->1
         self.graph.add_link(0,1);
@@ -283,7 +283,7 @@ impl eframe::App for App {
             ui.label("Node Graph (simple):");
             ui.horizontal(|ui| {
                 if ui.button("Add Memristor").clicked() {
-                    self.graph.add_node(NodeKind::Memristor { id: format!("m{}", self.graph.nodes.len()), ron: self.mem_ron, roff: self.mem_roff, state: self.mem_state_init, mu0: self.mem_mu0, n: self.mem_n, window_p: self.mem_window_p, ithreshold: self.mem_ithreshold });
+                    self.graph.add_node(NodeKind::Memristor { id: format!("m{}", self.graph.nodes.len()), ron: self.mem_ron, roff: self.mem_roff, state: self.mem_state_init, mu0: self.mem_mu0, n: self.mem_n, window_p: self.mem_window_p, ithreshold: self.mem_ithreshold, model: "HP".into() });
                 }
                 if ui.button("Add VSource").clicked() {
                     self.graph.add_node(NodeKind::VSource { id: format!("v{}", self.graph.nodes.len()), amp: self.drive_amp, freq: self.drive_freq, is_sine: self.drive_is_sine });

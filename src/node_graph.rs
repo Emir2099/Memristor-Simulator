@@ -5,7 +5,7 @@ use serde::{Serialize, Deserialize};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum NodeKind {
     VSource { id: String, amp: f64, freq: f64, is_sine: bool },
-    Memristor { id: String, ron: f64, roff: f64, state: f64, mu0: f64, n: f64, window_p: f64, ithreshold: f64 },
+    Memristor { id: String, ron: f64, roff: f64, state: f64, mu0: f64, n: f64, window_p: f64, ithreshold: f64, model: String },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -110,12 +110,26 @@ impl Graph {
         // Add memristors and R2 between source and mem node (only if the mem node net differs from source)
         let mut mem_count = 0;
         for n in &self.nodes {
-            if let NodeKind::Memristor { id: _, ron, roff, state, mu0, n: expn, window_p, ithreshold } = &n.kind {
+            if let NodeKind::Memristor { id: _, ron, roff, state, mu0: _, n: _expn, window_p: _, ithreshold: _, model } = &n.kind {
                 mem_count += 1;
                 let net_idx = *net_map.get(&n.id).unwrap_or(&0);
                 let mem_id = format!("M{}", mem_count);
-                // default to HP/TiO2 model for node-graph-created memristors
-                net.add(mna::Component::Memristor { id: mem_id.clone(), n1: net_idx, n2: 0, mem: crate::Memristor::new(crate::HpTiO2Model::new(mem_id.clone(), *ron, *roff, *state)) });
+                // choose model based on node-specified string
+                let mem = match model.as_str() {
+                    "VTEAM" => {
+                        let phys = crate::models::VTEAM::new(*ron, *roff, -1.0, 1.0);
+                        crate::Memristor::new(crate::PhysicsBackedModel::new(mem_id.clone(), Box::new(phys), *state))
+                    }
+                    "YAKOPCIC" | "Yakopcic" => {
+                        let phys = crate::models::Yakopcic::new(*ron, *roff);
+                        crate::Memristor::new(crate::PhysicsBackedModel::new(mem_id.clone(), Box::new(phys), *state))
+                    }
+                    _ => {
+                        // default: HP linear drift (existing simple model)
+                        crate::Memristor::new(crate::HpTiO2Model::new(mem_id.clone(), *ron, *roff, *state))
+                    }
+                };
+                net.add(mna::Component::Memristor { id: mem_id.clone(), n1: net_idx, n2: 0, mem });
                 // if there is a source, add R2 between source node (1) and this mem node, but only if nets differ
                 if let Some(_) = vs_node {
                     if net_idx != 1 {
