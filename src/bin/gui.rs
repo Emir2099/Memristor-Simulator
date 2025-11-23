@@ -316,7 +316,9 @@ impl eframe::App for App {
 
         // Left side: sample list and some stats
         // Narrow the side panel slightly to give more space to the central canvas
-        egui::SidePanel::left("left_panel").min_width(200.0).resizable(true).show(ctx, |ui| {
+            egui::SidePanel::left("left_panel").min_width(220.0).resizable(true).show(ctx, |ui| {
+            ui.heading("Telemetry & Tools");
+            ui.separator();
             ui.label("Last samples (time, node_2, state):");
             egui::ScrollArea::vertical().id_source("left_samples_scroll").max_height(280.0).show(ui, |ui| {
                 let n = self.times.len();
@@ -335,12 +337,13 @@ impl eframe::App for App {
             }
 
             ui.separator();
-            ui.label("Memristor params:");
-            ui.add(egui::DragValue::new(&mut self.mem_ron)); ui.label("ron");
-            ui.add(egui::DragValue::new(&mut self.mem_roff)); ui.label("roff");
+            ui.colored_label(egui::Color32::from_rgb(200,200,255), "Memristor params:");
+            ui.horizontal(|ui| { ui.label("ron:"); ui.add(egui::DragValue::new(&mut self.mem_ron)); });
+            ui.horizontal(|ui| { ui.label("roff:"); ui.add(egui::DragValue::new(&mut self.mem_roff)); });
 
             ui.separator();
-            ui.label("Node Graph (simple):");
+            ui.separator();
+            ui.heading("Node Graph");
             ui.horizontal(|ui| {
                 // model selection combo box for new memristor nodes
                 egui::ComboBox::from_id_source("model_choice").selected_text(self.model_choices[self.selected_model_choice].clone()).show_ui(ui, |ui| {
@@ -348,11 +351,11 @@ impl eframe::App for App {
                         ui.selectable_value(&mut self.selected_model_choice, i, m);
                     }
                 });
-                if ui.button("Add Memristor").clicked() {
+                if ui.add(egui::Button::new("Add Memristor").stroke(egui::Stroke::new(1.5, egui::Color32::from_rgb(0,150,136)))).clicked() {
                     let chosen = self.model_choices[self.selected_model_choice].clone();
                     self.graph.add_node(NodeKind::Memristor { id: format!("m{}", self.graph.nodes.len()), ron: self.mem_ron, roff: self.mem_roff, state: self.mem_state_init, mu0: self.mem_mu0, n: self.mem_n, window_p: self.mem_window_p, ithreshold: self.mem_ithreshold, model: chosen });
                 }
-                if ui.button("Add VSource").clicked() {
+                if ui.add(egui::Button::new("Add VSource").stroke(egui::Stroke::new(1.5, egui::Color32::from_rgb(0,120,200)))).clicked() {
                     self.graph.add_node(NodeKind::VSource { id: format!("v{}", self.graph.nodes.len()), amp: self.drive_amp, freq: self.drive_freq, is_sine: self.drive_is_sine });
                 }
             });
@@ -379,7 +382,7 @@ impl eframe::App for App {
             });
 
             ui.separator();
-                if ui.horizontal(|ui| ui.button("Build Netlist").clicked()).inner {
+            if ui.add(egui::Button::new(egui::RichText::new("⚙ Build Netlist").size(14.0))).clicked() {
                 // build netlist using inspector parameters
                 let net = self.graph.to_netlist_with_params(self.vteam_von, self.vteam_voff, self.yak_a1, self.yak_a2, self.yak_b);
                 // construct preview string
@@ -408,17 +411,17 @@ impl eframe::App for App {
                 self.last_net = Some(net);
             }
 
-                ui.separator();
+            ui.separator();
                 ui.horizontal(|ui| {
-                    if ui.button("Delete Selected Node").clicked() {
+                    if ui.add(egui::Button::new(egui::RichText::new("🗑 Delete Selected Node").size(12.0)).stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(180,30,30)))).clicked() {
                         self.delete_selected_node();
                     }
-                    if ui.button("Delete Selected Link").clicked() {
+                    if ui.add(egui::Button::new(egui::RichText::new("❌ Delete Selected Link").size(12.0)).stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(180,30,30)))).clicked() {
                         if let Some(link_idx) = self.selected_link { self.delete_link_index(link_idx); self.selected_link = None; }
                     }
                 });
 
-                if ui.button("Populate Example").clicked() {
+                if ui.add(egui::Button::new(egui::RichText::new("✨ Populate Example").size(13.0)).fill(egui::Color32::from_rgb(50,90,140))).clicked() {
                     self.populate_example();
                 }
 
@@ -532,13 +535,33 @@ impl eframe::App for App {
                 ui.painter().rect_filled(node_rect, 8.0, bg);
                 ui.painter().rect_filled(header_rect, 8.0, egui::Color32::from_rgb(0, 120, 160));
                 ui.painter().rect_stroke(node_rect, 8.0, egui::Stroke::new(stroke_w, stroke_col));
-                ui.painter().text(header_rect.center() + egui::vec2(0.0,0.0), egui::Align2::CENTER_CENTER, format!("{}", i), egui::FontId::proportional(12.0 * self.zoom), egui::Color32::WHITE);
+                // header label with small kind icon
+                let header_label = match &n.kind {
+                    memristor_sim::node_graph::NodeKind::VSource { .. } => format!("{} ⚡", i),
+                    memristor_sim::node_graph::NodeKind::Memristor { .. } => format!("{} 𝑀", i),
+                };
+                ui.painter().text(header_rect.center() + egui::vec2(0.0,0.0), egui::Align2::CENTER_CENTER, header_label, egui::FontId::proportional(12.0 * self.zoom), egui::Color32::WHITE);
 
-                // draw small pins on left (input) and right (output)
+                // draw small pins on left (input) and right (output) with hover highlight
                 let left_pin = egui::pos2(node_rect.left() + 8.0 * self.zoom, node_rect.center().y);
                 let right_pin = egui::pos2(node_rect.right() - 8.0 * self.zoom, node_rect.center().y);
-                ui.painter().circle_filled(left_pin, 6.0, egui::Color32::from_rgb(200,200,200));
-                ui.painter().circle_filled(right_pin, 6.0, egui::Color32::from_rgb(200,200,200));
+                let pin_radius = 6.0 * self.zoom;
+                let left_hover = pointer_pos.map_or(false, |pp| {
+                    let dx = pp.x - left_pin.x; let dy = pp.y - left_pin.y; (dx*dx + dy*dy).sqrt() < pin_radius * 2.0
+                });
+                let right_hover = pointer_pos.map_or(false, |pp| {
+                    let dx = pp.x - right_pin.x; let dy = pp.y - right_pin.y; (dx*dx + dy*dy).sqrt() < pin_radius * 2.0
+                });
+                let base_pin_col = egui::Color32::from_rgb(200,200,200);
+                let hover_pin_col = egui::Color32::from_rgb(0,200,120);
+                ui.painter().circle_filled(left_pin, pin_radius, if left_hover { hover_pin_col } else { base_pin_col });
+                ui.painter().circle_filled(right_pin, pin_radius, if right_hover { hover_pin_col } else { base_pin_col });
+                if left_hover {
+                    ui.painter().add(egui::Shape::circle_stroke(left_pin, pin_radius + 3.0, egui::Stroke::new(2.0, hover_pin_col)));
+                }
+                if right_hover {
+                    ui.painter().add(egui::Shape::circle_stroke(right_pin, pin_radius + 3.0, egui::Stroke::new(2.0, hover_pin_col)));
+                }
 
                 // If this node is the current connect source, draw an outline to indicate it
                 if self.connect_src == Some(i) {
@@ -579,9 +602,11 @@ impl eframe::App for App {
                             // begin link dragging from this node; record it as last_dragged for later link creation
                             self.link_dragging = true;
                             last_dragged = Some(i);
+                            println!("editor: started link_dragging from node {}", i);
                         } else {
                             self.dragging_node = Some(i);
                             self.drag_offset = pp.to_vec2() - top_left.to_vec2();
+                            println!("editor: started dragging node {} at offset {:?}", i, self.drag_offset);
                         }
                     }
                 }
@@ -620,6 +645,7 @@ impl eframe::App for App {
                             // remember which node was dragged before clearing
                             last_dragged = Some(i);
                             self.dragging_node = None;
+                            println!("editor: finished dragging node {} -> pos {:?}", i, self.node_positions[i]);
                         }
                     }
                 }
@@ -640,6 +666,7 @@ impl eframe::App for App {
                     }
                     // link creation will be handled after the loop using last_dragged and released_over
                     self.link_dragging = false;
+                    println!("editor: stopped link_dragging; released_over={:?}, last_dragged={:?}", released_over, last_dragged);
                 }
             }
 
@@ -750,7 +777,10 @@ impl eframe::App for App {
             if let Some(j) = released_over {
                 // create link from last-dragged node -> j (fall back to selected_node)
                 if let Some(i) = last_dragged.or(self.selected_node) {
-                    if i != j { self.graph.add_link(i, j); }
+                    if i != j {
+                        println!("editor: creating link {} -> {}", i, j);
+                        self.graph.add_link(i, j);
+                    }
                 }
             }
 
