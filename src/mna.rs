@@ -85,167 +85,222 @@ impl Netlist {
         let n_vs = self.comps.iter().filter(|c| matches!(c, Component::VSource { .. })).count();
         let n = n_var_nodes + n_vs; // total unknowns
 
-        let mut a = vec![vec![0.0; n]; n];
-        let mut b = vec![0.0; n];
+        // We'll perform a Newton-Raphson loop on node voltages. For each NR iteration we
+        // linearize memristors by treating their internal state as fixed for that iterate
+        // (we solve the memristor state implicitly per candidate voltage via a small inner loop),
+        // then stamp the instantaneous conductance g = 1 / R(s_guess) and solve the linear MNA.
+        // Repeat until voltage corrections are small.
 
-        // map voltage source index to its column
-        let mut vs_map = Vec::new(); // (comp_index, vs_idx)
-
-        // First pass: stamp resistors and memristors conductance
-        for (ci, comp) in self.comps.iter().enumerate() {
-                match comp {
-                Component::Resistor { n1, n2, r, .. } => {
-                    let g = 1.0 / *r;
-                    if *n1 != 0 {
-                        let i = *n1 - 1;
-                        a[i][i] += g;
-                    }
-                    if *n2 != 0 {
-                        let j = *n2 - 1;
-                        a[j][j] += g;
-                    }
-                    if *n1 != 0 && *n2 != 0 {
-                        let i = *n1 - 1;
-                        let j = *n2 - 1;
-                        a[i][j] -= g;
-                        a[j][i] -= g;
-                    }
-                }
-                Component::Memristor { n1, n2, mem, .. } => {
-                    let r_now = mem.resistance();
-                    let g = if r_now <= 0.0 { 0.0 } else { 1.0 / r_now };
-                    if *n1 != 0 {
-                        let i = *n1 - 1;
-                        a[i][i] += g;
-                    }
-                    if *n2 != 0 {
-                        let j = *n2 - 1;
-                        a[j][j] += g;
-                    }
-                    if *n1 != 0 && *n2 != 0 {
-                        let i = *n1 - 1;
-                        let j = *n2 - 1;
-                        a[i][j] -= g;
-                        a[j][i] -= g;
-                    }
-                }
-                Component::Capacitor { id: _, n1, n2, c } => {
-                    let g = *c / dt;
-                    // stamp like a resistor with conductance g and add RHS from previous voltage
-                    let vprev = *self.cap_vprev.get(&ci).unwrap_or(&0.0);
-                    if *n1 != 0 {
-                        let i = *n1 - 1;
-                        a[i][i] += g;
-                        if *n2 != 0 {
-                            let j = *n2 - 1;
-                            a[i][j] -= g;
-                        }
-                        // RHS contribution: g * vprev_diff added to node n1
-                        b[*n1 - 1] += g * vprev;
-                    }
-                    if *n2 != 0 {
-                        let j = *n2 - 1;
-                        a[j][j] += g;
-                        if *n1 != 0 {
-                            let i = *n1 - 1;
-                            a[j][i] -= g;
-                        }
-                        // RHS contribution: -g * vprev_diff added to node n2
-                        b[*n2 - 1] -= g * vprev;
-                    }
-                }
-                Component::CurrentSource { id: _, n_plus, n_minus, i } => {
-                    // current I from n_plus -> n_minus; add to RHS: n_plus -= I, n_minus += I
-                    if *n_plus != 0 {
-                        b[*n_plus - 1] -= *i;
-                    }
-                    if *n_minus != 0 {
-                        b[*n_minus - 1] += *i;
-                    }
-                }
-                Component::VSource { .. } => {
-                    vs_map.push(ci);
-                }
-            }
-        }
-
-        // Second pass: stamp voltage sources (rows/cols for KVL equations)
-        for (k, &ci) in vs_map.iter().enumerate() {
-            // column/row index for this voltage source in MNA
-            let vs_col = n_var_nodes + k;
-            if let Component::VSource { n_plus, n_minus, kind, .. } = &self.comps[ci] {
-                if *n_plus != 0 {
-                    let i = *n_plus - 1;
-                    a[i][vs_col] += 1.0;
-                    a[vs_col][i] += 1.0;
-                }
-                if *n_minus != 0 {
-                    let j = *n_minus - 1;
-                    a[j][vs_col] -= 1.0;
-                    a[vs_col][j] -= 1.0;
-                }
-                // RHS is voltage value
-                b[vs_col] = kind.value_at(t);
-            }
-        }
-
-        // convert a (Vec<Vec>) and b (Vec) into nalgebra matrices and solve with LU
         if n == 0 {
-            // nothing to solve
             return Some(MnaResult { node_voltages: vec![0.0; n_nodes], vs_currents: Vec::new() });
         }
 
-        // flatten row-major
-        let mut flat = Vec::with_capacity(n * n);
-        for row in &a {
-            for &v in row.iter() {
-                flat.push(v);
-            }
-        }
-        let a_mat = DMatrix::from_row_slice(n, n, &flat);
-        let b_vec = DVector::from_row_slice(&b);
-
-        let lu = LU::new(a_mat);
-        let sol_vec_opt = lu.solve(&b_vec);
-        let sol_vec = match sol_vec_opt {
-            Some(sv) => sv,
-            None => return None,
+        // helper: compute ds_dt given memristor params at arbitrary s and current i
+        let compute_ds_dt = |m: &Memristor, s: f64, current: f64| -> f64 {
+            if current.abs() <= m.ithreshold { return 0.0; }
+            let s_clamped = s.clamp(0.0, 1.0);
+            let two_x_m1 = 2.0 * s_clamped - 1.0;
+            let f_win = 1.0 - two_x_m1.abs().powf(2.0 * m.window_p);
+            let k_b_ev = 8.617333262145e-5_f64;
+            let temp_factor = (-m.activation_e / (k_b_ev * m.temperature)).exp();
+            let i_eff = (current.abs() - m.ithreshold).max(0.0).powf(m.n) * current.signum();
+            m.mu0 * temp_factor * i_eff * f_win
         };
 
-        // extract node voltages
+        // Inner solver: for a given voltage drop vdrop and previous state s_old, solve for s_new via fixed-point
+        let solve_state_given_voltage = |m: &Memristor, vdrop: f64, s_old: f64, dt_local: f64| -> f64 {
+            let mut s = s_old;
+            for _iter in 0..12 {
+                let r = m.ron * s + m.roff * (1.0 - s);
+                let current = if r <= 0.0 { 0.0 } else { vdrop / r };
+                let ds = compute_ds_dt(m, s, current);
+                let s_next = (s_old + ds * dt_local).clamp(0.0, 1.0);
+                if (s_next - s).abs() < 1e-8 { s = s_next; break; }
+                s = s_next;
+            }
+            s
+        };
+
+        // Initial guess: solve linear problem using current mem resistances (explicit-like) to get starting voltages
+        // Build system A0 * V0 = b0
+        let mut flat0 = Vec::new();
+        let mut v_guess = vec![0.0f64; n_var_nodes];
+        {
+            let mut a0 = vec![vec![0.0; n]; n];
+            let mut b0 = vec![0.0; n];
+            let mut vs_map = Vec::new();
+            for (ci, comp) in self.comps.iter().enumerate() {
+                match comp {
+                    Component::Resistor { n1, n2, r, .. } => {
+                        let g = 1.0 / *r;
+                        if *n1 != 0 { let i = *n1 - 1; a0[i][i] += g; }
+                        if *n2 != 0 { let j = *n2 - 1; a0[j][j] += g; }
+                        if *n1 != 0 && *n2 != 0 { let i = *n1 - 1; let j = *n2 - 1; a0[i][j] -= g; a0[j][i] -= g; }
+                    }
+                    Component::Memristor { n1, n2, mem, .. } => {
+                        let r_now = mem.resistance();
+                        let g = if r_now <= 0.0 { 0.0 } else { 1.0 / r_now };
+                        if *n1 != 0 { let i = *n1 - 1; a0[i][i] += g; }
+                        if *n2 != 0 { let j = *n2 - 1; a0[j][j] += g; }
+                        if *n1 != 0 && *n2 != 0 { let i = *n1 - 1; let j = *n2 - 1; a0[i][j] -= g; a0[j][i] -= g; }
+                    }
+                    Component::Capacitor { id: _, n1, n2, c } => {
+                        let g = *c / dt;
+                        let vprev = *self.cap_vprev.get(&ci).unwrap_or(&0.0);
+                        if *n1 != 0 { let i = *n1 - 1; a0[i][i] += g; if *n2 != 0 { let j = *n2 - 1; a0[i][j] -= g; } b0[*n1 - 1] += g * vprev; }
+                        if *n2 != 0 { let j = *n2 - 1; a0[j][j] += g; if *n1 != 0 { let i = *n1 - 1; a0[j][i] -= g; } b0[*n2 - 1] -= g * vprev; }
+                    }
+                    Component::CurrentSource { id: _, n_plus, n_minus, i } => {
+                        if *n_plus != 0 { b0[*n_plus - 1] -= *i; }
+                        if *n_minus != 0 { b0[*n_minus - 1] += *i; }
+                    }
+                    Component::VSource { .. } => { vs_map.push(ci); }
+                }
+            }
+            for (k, &ci) in vs_map.iter().enumerate() {
+                let vs_col = n_var_nodes + k;
+                if let Component::VSource { n_plus, n_minus, kind, .. } = &self.comps[ci] {
+                    if *n_plus != 0 { let i = *n_plus - 1; a0[i][vs_col] += 1.0; a0[vs_col][i] += 1.0; }
+                    if *n_minus != 0 { let j = *n_minus - 1; a0[j][vs_col] -= 1.0; a0[vs_col][j] -= 1.0; }
+                    b0[vs_col] = kind.value_at(t);
+                }
+            }
+            // flatten and solve
+            flat0.reserve(n * n);
+            for row in &a0 { for &v in row.iter() { flat0.push(v); } }
+            let a_mat0 = DMatrix::from_row_slice(n, n, &flat0);
+            let b_vec0 = DVector::from_row_slice(&b0);
+            let lu0 = LU::new(a_mat0);
+            if let Some(sol0) = lu0.solve(&b_vec0) {
+                for ni in 1..n_nodes { v_guess[ni - 1] = sol0[ni - 1]; }
+            }
+        }
+
+        let mut v_curr = v_guess.clone();
+        let mut vs_currents = vec![0.0f64; n_vs];
+
+        // Newton-Raphson on voltages
+        for _nr_iter in 0..12 {
+            // per-iteration assembly
+            let mut a = vec![vec![0.0; n]; n];
+            let mut b = vec![0.0; n];
+            let mut vs_map = Vec::new();
+
+            // For memristor state guesses we will compute provisional s for the current v_curr
+            let mut mem_s_guess: HashMap<usize, f64> = HashMap::new();
+            for (ci, comp) in self.comps.iter().enumerate() {
+                if let Component::Memristor { n1: _, n2: _, mem, .. } = comp {
+                    mem_s_guess.insert(ci, mem.state);
+                }
+            }
+
+            // Update each memristor's s_guess given v_curr at its terminals (inner fixed-point)
+            for (ci, comp) in self.comps.iter().enumerate() {
+                if let Component::Memristor { n1, n2, mem, .. } = comp {
+                    let v1 = if *n1 == 0 { 0.0 } else { v_curr[*n1 - 1] };
+                    let v2 = if *n2 == 0 { 0.0 } else { v_curr[*n2 - 1] };
+                    let vdrop = v1 - v2;
+                    let s_old = mem.state;
+                    let s_new = solve_state_given_voltage(mem, vdrop, s_old, dt);
+                    mem_s_guess.insert(ci, s_new);
+                }
+            }
+
+            // stamp components using mem_s_guess for memristors
+            for (ci, comp) in self.comps.iter().enumerate() {
+                match comp {
+                    Component::Resistor { n1, n2, r, .. } => {
+                        let g = 1.0 / *r;
+                        if *n1 != 0 { let i = *n1 - 1; a[i][i] += g; }
+                        if *n2 != 0 { let j = *n2 - 1; a[j][j] += g; }
+                        if *n1 != 0 && *n2 != 0 { let i = *n1 - 1; let j = *n2 - 1; a[i][j] -= g; a[j][i] -= g; }
+                    }
+                    Component::Memristor { n1, n2, mem, .. } => {
+                        let s_guess = *mem_s_guess.get(&ci).unwrap_or(&mem.state);
+                        let r_now = mem.ron * s_guess + mem.roff * (1.0 - s_guess);
+                        let g = if r_now <= 0.0 { 0.0 } else { 1.0 / r_now };
+                        if *n1 != 0 { let i = *n1 - 1; a[i][i] += g; }
+                        if *n2 != 0 { let j = *n2 - 1; a[j][j] += g; }
+                        if *n1 != 0 && *n2 != 0 { let i = *n1 - 1; let j = *n2 - 1; a[i][j] -= g; a[j][i] -= g; }
+                    }
+                    Component::Capacitor { id: _, n1, n2, c } => {
+                        let g = *c / dt;
+                        let vprev = *self.cap_vprev.get(&ci).unwrap_or(&0.0);
+                        if *n1 != 0 { let i = *n1 - 1; a[i][i] += g; if *n2 != 0 { let j = *n2 - 1; a[i][j] -= g; } b[*n1 - 1] += g * vprev; }
+                        if *n2 != 0 { let j = *n2 - 1; a[j][j] += g; if *n1 != 0 { let i = *n1 - 1; a[j][i] -= g; } b[*n2 - 1] -= g * vprev; }
+                    }
+                    Component::CurrentSource { id: _, n_plus, n_minus, i } => {
+                        if *n_plus != 0 { b[*n_plus - 1] -= *i; }
+                        if *n_minus != 0 { b[*n_minus - 1] += *i; }
+                    }
+                    Component::VSource { .. } => { vs_map.push(ci); }
+                }
+            }
+
+            for (k, &ci) in vs_map.iter().enumerate() {
+                let vs_col = n_var_nodes + k;
+                if let Component::VSource { n_plus, n_minus, kind, .. } = &self.comps[ci] {
+                    if *n_plus != 0 { let i = *n_plus - 1; a[i][vs_col] += 1.0; a[vs_col][i] += 1.0; }
+                    if *n_minus != 0 { let j = *n_minus - 1; a[j][vs_col] -= 1.0; a[vs_col][j] -= 1.0; }
+                    b[vs_col] = kind.value_at(t);
+                }
+            }
+
+            // flatten and solve linear system for this NR iteration
+            let mut flat = Vec::with_capacity(n * n);
+            for row in &a { for &v in row.iter() { flat.push(v); } }
+            let a_mat = DMatrix::from_row_slice(n, n, &flat);
+            let b_vec = DVector::from_row_slice(&b);
+            let lu = LU::new(a_mat);
+            let sol_vec_opt = lu.solve(&b_vec);
+            let sol_vec = match sol_vec_opt { Some(sv) => sv, None => return None };
+
+            // extract new voltages
+            let mut v_new = vec![0.0f64; n_var_nodes];
+            for ni in 1..n_nodes { v_new[ni - 1] = sol_vec[ni - 1]; }
+
+            // check convergence
+            let mut max_diff = 0.0f64;
+            for i in 0..n_var_nodes { max_diff = max_diff.max((v_new[i] - v_curr[i]).abs()); }
+
+            v_curr = v_new;
+
+            if max_diff < 1e-9 { // converged
+                // fill node_voltages and vs_currents
+                let mut node_voltages = vec![0.0; n_nodes];
+                for ni in 1..n_nodes { node_voltages[ni] = v_curr[ni - 1]; }
+                for k in 0..n_vs { vs_currents[k] = sol_vec[n_var_nodes + k]; }
+
+                // commit memristor states using final voltages
+                for (_ci, comp) in self.comps.iter_mut().enumerate() {
+                    if let Component::Memristor { n1, n2, mem, .. } = comp {
+                        let v1 = if *n1 == 0 { 0.0 } else { node_voltages[*n1] };
+                        let v2 = if *n2 == 0 { 0.0 } else { node_voltages[*n2] };
+                        let vdrop = v1 - v2;
+                        let s_old = mem.state;
+                        let s_new = solve_state_given_voltage(mem, vdrop, s_old, dt);
+                        mem.state = s_new;
+                    }
+                }
+
+                // update capacitor previous-voltages
+                for (ci, comp) in self.comps.iter().enumerate() {
+                    if let Component::Capacitor { n1, n2, .. } = comp {
+                        let v1 = if *n1 == 0 { 0.0 } else { node_voltages[*n1] };
+                        let v2 = if *n2 == 0 { 0.0 } else { node_voltages[*n2] };
+                        let vprev = v1 - v2;
+                        self.cap_vprev.insert(ci, vprev);
+                    }
+                }
+
+                return Some(MnaResult { node_voltages, vs_currents });
+            }
+        }
+
+        // If NR did not converge, return last iterate (best-effort)
+        // populate outputs from v_curr
         let mut node_voltages = vec![0.0; n_nodes];
-        for ni in 1..n_nodes {
-            let idx = ni - 1;
-            node_voltages[ni] = sol_vec[idx];
-        }
-
-        // extract voltage source currents
-        let mut vs_currents = Vec::new();
-        for k in 0..n_vs {
-            vs_currents.push(sol_vec[n_var_nodes + k]);
-        }
-
-        // Update memristors' state using solved voltages
-        for comp in &mut self.comps {
-            if let Component::Memristor { mem, n1, n2, .. } = comp {
-                let v1 = if *n1 == 0 { 0.0 } else { node_voltages[*n1] };
-                let v2 = if *n2 == 0 { 0.0 } else { node_voltages[*n2] };
-                let vdrop = v1 - v2;
-                let i = if mem.resistance() <= 0.0 { 0.0 } else { vdrop / mem.resistance() };
-                mem.update_state(i, dt);
-            }
-        }
-
-        // Update stored capacitor previous-voltages so C/dt companion sources are correct
-        for (ci, comp) in self.comps.iter().enumerate() {
-            if let Component::Capacitor { n1, n2, .. } = comp {
-                let v1 = if *n1 == 0 { 0.0 } else { node_voltages[*n1] };
-                let v2 = if *n2 == 0 { 0.0 } else { node_voltages[*n2] };
-                let vprev = v1 - v2;
-                self.cap_vprev.insert(ci, vprev);
-            }
-        }
-
+        for ni in 1..n_nodes { node_voltages[ni] = v_curr[ni - 1]; }
         Some(MnaResult { node_voltages, vs_currents })
     }
 }
