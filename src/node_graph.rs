@@ -151,6 +151,79 @@ impl Graph {
         net
     }
 
+    /// Build a netlist while allowing model-specific parameter overrides for VTEAM and Yakopcic.
+    pub fn to_netlist_with_params(&self, vteam_v_on: f64, vteam_v_off: f64, yak_a1: f64, yak_a2: f64, yak_b: f64) -> mna::Netlist {
+        let mut net = mna::Netlist::new();
+
+        // find the first VSource (if any)
+        let mut vs_node: Option<usize> = None;
+        for n in &self.nodes {
+            if let NodeKind::VSource { .. } = n.kind {
+                vs_node = Some(n.id);
+                break;
+            }
+        }
+
+        // map node id -> net index
+        let mut net_map: HashMap<usize, usize> = HashMap::new();
+        let mut next_net = 2usize; // reserve 1 for source node if present
+
+        if let Some(vs) = vs_node {
+            net_map.insert(vs, 1);
+        }
+
+        for n in &self.nodes {
+            if let NodeKind::Memristor { .. } = &n.kind {
+                net_map.insert(n.id, next_net);
+                next_net += 1;
+            }
+        }
+
+        if vs_node.is_some() {
+            net.add(mna::Component::Resistor { id: "R1".into(), n1: 1, n2: 0, r: 1e3 });
+        }
+
+        let mut mem_count = 0;
+        for n in &self.nodes {
+            if let NodeKind::Memristor { id: _, ron, roff, state, mu0: _, n: _expn, window_p: _, ithreshold: _, model } = &n.kind {
+                mem_count += 1;
+                let net_idx = *net_map.get(&n.id).unwrap_or(&0);
+                let mem_id = format!("M{}", mem_count);
+                let mem = match model.as_str() {
+                    "VTEAM" => {
+                        let mut phys = crate::models::VTEAM::new(*ron, *roff, vteam_v_on, vteam_v_off);
+                        phys.k_off = 1e-3; phys.k_on = 1e-3; phys.alpha_off = 1.0; phys.alpha_on = 1.0;
+                        crate::Memristor::new(crate::PhysicsBackedModel::new(mem_id.clone(), Box::new(phys), *state))
+                    }
+                    "YAKOPCIC" | "Yakopcic" => {
+                        let mut phys = crate::models::Yakopcic::new(*ron, *roff);
+                        phys.a1 = yak_a1; phys.a2 = yak_a2; phys.b = yak_b;
+                        crate::Memristor::new(crate::PhysicsBackedModel::new(mem_id.clone(), Box::new(phys), *state))
+                    }
+                    _ => {
+                        crate::Memristor::new(crate::HpTiO2Model::new(mem_id.clone(), *ron, *roff, *state))
+                    }
+                };
+                net.add(mna::Component::Memristor { id: mem_id.clone(), n1: net_idx, n2: 0, mem });
+                if let Some(_) = vs_node {
+                    if net_idx != 1 {
+                        let r2id = format!("R2_{}", mem_count);
+                        net.add(mna::Component::Resistor { id: r2id, n1: 1, n2: net_idx, r: 2e3 });
+                    }
+                }
+            }
+        }
+
+        if let Some(vn) = vs_node {
+            if let NodeKind::VSource { id: _, amp, freq, is_sine } = &self.nodes[vn].kind {
+                let kind = if *is_sine { mna::VoltageKind::Sine { amp: *amp, freq: *freq, phase: 0.0 } } else { mna::VoltageKind::DC(*amp) };
+                net.add(mna::Component::VSource { id: "V1".into(), n_plus: 1, n_minus: 0, kind });
+            }
+        }
+
+        net
+    }
+
     // Return a textual preview of the netlist and simple validation warnings.
     pub fn to_netlist_preview(&self) -> (String, Vec<String>) {
         let net = self.to_netlist();

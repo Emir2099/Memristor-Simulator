@@ -43,6 +43,18 @@ struct App {
     selected_node: Option<usize>,
     dragging_node: Option<usize>,
     drag_offset: egui::Vec2,
+    // canvas transform
+    pan: egui::Vec2,
+    zoom: f32,
+    // model inspector params (global defaults)
+    vteam_von: f64,
+    vteam_voff: f64,
+    yak_a1: f64,
+    yak_a2: f64,
+    yak_b: f64,
+    // model selection for adding nodes
+    model_choices: Vec<String>,
+    selected_model_choice: usize,
 }
 
 impl Default for App {
@@ -80,6 +92,15 @@ impl Default for App {
             selected_node: None,
             dragging_node: None,
             drag_offset: egui::vec2(0.0,0.0),
+            pan: egui::vec2(0.0, 0.0),
+            zoom: 1.0,
+            vteam_von: -1.0,
+            vteam_voff: 1.0,
+            yak_a1: 1e-3,
+            yak_a2: 1e-3,
+            yak_b: 1.0,
+            model_choices: vec!["HP".into(), "VTEAM".into(), "YAKOPCIC".into()],
+            selected_model_choice: 0,
         };
 
         // try to load saved node positions
@@ -87,6 +108,24 @@ impl Default for App {
 
         app
     }
+}
+
+// Configure neuromorphic dark theme and styles
+fn configure_styles(ctx: &egui::Context) {
+    let mut style = (*ctx.style()).clone();
+    let mut ts = style.text_styles.clone();
+    ts.insert(egui::TextStyle::Heading, egui::FontId::new(20.0, egui::FontFamily::Proportional));
+    ts.insert(egui::TextStyle::Body, egui::FontId::new(14.0, egui::FontFamily::Proportional));
+    ts.insert(egui::TextStyle::Monospace, egui::FontId::new(12.0, egui::FontFamily::Monospace));
+    ts.insert(egui::TextStyle::Button, egui::FontId::new(14.0, egui::FontFamily::Proportional));
+    ts.insert(egui::TextStyle::Small, egui::FontId::new(11.0, egui::FontFamily::Proportional));
+    style.text_styles = ts;
+    style.visuals = egui::Visuals::dark();
+    style.visuals.window_rounding = egui::Rounding::same(10.0);
+    style.visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(20, 20, 25);
+    style.visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(40, 40, 50);
+    style.visuals.selection.bg_fill = egui::Color32::from_rgb(0, 180, 255);
+    ctx.set_style(style);
 }
 
 impl App {
@@ -282,8 +321,15 @@ impl eframe::App for App {
             ui.separator();
             ui.label("Node Graph (simple):");
             ui.horizontal(|ui| {
+                // model selection combo box for new memristor nodes
+                egui::ComboBox::from_id_source("model_choice").selected_text(self.model_choices[self.selected_model_choice].clone()).show_ui(ui, |ui| {
+                    for (i, m) in self.model_choices.iter().enumerate() {
+                        ui.selectable_value(&mut self.selected_model_choice, i, m);
+                    }
+                });
                 if ui.button("Add Memristor").clicked() {
-                    self.graph.add_node(NodeKind::Memristor { id: format!("m{}", self.graph.nodes.len()), ron: self.mem_ron, roff: self.mem_roff, state: self.mem_state_init, mu0: self.mem_mu0, n: self.mem_n, window_p: self.mem_window_p, ithreshold: self.mem_ithreshold, model: "HP".into() });
+                    let chosen = self.model_choices[self.selected_model_choice].clone();
+                    self.graph.add_node(NodeKind::Memristor { id: format!("m{}", self.graph.nodes.len()), ron: self.mem_ron, roff: self.mem_roff, state: self.mem_state_init, mu0: self.mem_mu0, n: self.mem_n, window_p: self.mem_window_p, ithreshold: self.mem_ithreshold, model: chosen });
                 }
                 if ui.button("Add VSource").clicked() {
                     self.graph.add_node(NodeKind::VSource { id: format!("v{}", self.graph.nodes.len()), amp: self.drive_amp, freq: self.drive_freq, is_sine: self.drive_is_sine });
@@ -313,8 +359,18 @@ impl eframe::App for App {
 
             ui.separator();
                 if ui.horizontal(|ui| ui.button("Build Netlist").clicked()).inner {
-                let (preview, warnings) = self.graph.to_netlist_preview();
-                let net = self.graph.to_netlist();
+                // build netlist using inspector parameters
+                let net = self.graph.to_netlist_with_params(self.vteam_von, self.vteam_voff, self.yak_a1, self.yak_a2, self.yak_b);
+                // construct preview string
+                let mut preview = String::new();
+                for c in &net.comps { preview.push_str(&format!("{}", c)); }
+                // simple validation warnings
+                let mut warnings = Vec::new();
+                for c in &net.comps {
+                    if let memristor_sim::mna::Component::Resistor { id, n1, n2, .. } = c {
+                        if n1 == n2 { warnings.push(format!("Resistor {} has identical terminals ({} == {})", id, n1, n2)); }
+                    }
+                }
                 // populate mem options
                 let mut mems = Vec::new();
                 for c in &net.comps {
@@ -396,14 +452,32 @@ impl eframe::App for App {
                 let max_editor = (available.x - 260.0_f32).max(min_editor);
                 let preferred = available.x * 0.70_f32;
                 let editor_w = preferred.clamp(min_editor, max_editor);
-                let plot_w = (available.x - editor_w).max(260.0_f32);
 
-                // Editor column
+                        // Editor column
                 ui.vertical(|ui| {
                     ui.label("Visual Node Editor:");
                     let height = available.y.max(200.0).min(720.0);
                     let (editor_rect, _resp) = ui.allocate_exact_size(egui::vec2(editor_w, height), egui::Sense::click());
-                    ui.painter().rect_filled(editor_rect, 4.0, egui::Color32::from_rgb(40,40,44));
+                            // draw blueprint grid background (respect pan/zoom)
+                            let grid_color = egui::Color32::from_rgb(30, 36, 44);
+                            ui.painter().rect_filled(editor_rect, 4.0, egui::Color32::from_rgb(18,18,22));
+                            let grid_spacing = (28.0 * self.zoom).max(8.0);
+                            let left = editor_rect.left(); let top = editor_rect.top();
+                            let right = editor_rect.right(); let bottom = editor_rect.bottom();
+                            // vertical lines
+                            let pan_x = self.pan.x % grid_spacing;
+                            let pan_y = self.pan.y % grid_spacing;
+                            let mut x = left - pan_x;
+                            while x < right {
+                                ui.painter().line_segment([egui::pos2(x, top), egui::pos2(x, bottom)], egui::Stroke::new(1.0, grid_color));
+                                x += grid_spacing;
+                            }
+                            // horizontal lines
+                            let mut y = top - pan_y;
+                            while y < bottom {
+                                ui.painter().line_segment([egui::pos2(left, y), egui::pos2(right, y)], egui::Stroke::new(1.0, grid_color));
+                                y += grid_spacing;
+                            }
 
                     // ensure node_positions matches nodes
                     while self.node_positions.len() < self.graph.nodes.len() { let idx = self.node_positions.len(); self.node_positions.push([20.0 + (idx as f32)*140.0, 20.0 + ((idx/4) as f32)*100.0]); }
@@ -415,22 +489,28 @@ impl eframe::App for App {
 
                     for (i, n) in self.graph.nodes.iter().enumerate() {
                         let pos = self.node_positions[i];
-                        let node_size = egui::vec2(120.0, 60.0);
-                        let top_left = editor_rect.left_top() + egui::vec2(pos[0], pos[1]);
+                        let node_size = egui::vec2(120.0, 60.0) * self.zoom;
+                        let top_left = editor_rect.left_top() + egui::vec2(pos[0] * self.zoom + self.pan.x, pos[1] * self.zoom + self.pan.y);
                         let node_rect = egui::Rect::from_min_size(top_left, node_size);
 
                             // draw node background and border (highlight if selected)
                             let selected = self.selected_node == Some(i);
-                            let bg = if selected { egui::Color32::from_rgb(70,70,86) } else { egui::Color32::from_rgb(60,60,64) };
-                            let stroke_col = if selected { egui::Color32::from_rgb(255,200,0) } else { egui::Color32::from_rgb(110,110,120) };
+                            // draw shadow
+                            ui.painter().rect_filled(node_rect.shrink(-6.0), 10.0, egui::Color32::from_rgba_unmultiplied(0,0,0,180));
+                            let bg = if selected { egui::Color32::from_rgb(38,48,64) } else { egui::Color32::from_rgb(34,36,40) };
+                            let stroke_col = if selected { egui::Color32::from_rgb(0,180,255) } else { egui::Color32::from_rgb(90,100,110) };
                             let stroke_w = if selected { 2.5 } else { 1.0 };
+                            // header
+                            let header_h = 18.0 * self.zoom;
+                            let header_rect = egui::Rect::from_min_max(node_rect.min, egui::pos2(node_rect.max.x, node_rect.min.y + header_h));
                             ui.painter().rect_filled(node_rect, 8.0, bg);
+                            ui.painter().rect_filled(header_rect, 8.0, egui::Color32::from_rgb(0, 120, 160));
                             ui.painter().rect_stroke(node_rect, 8.0, egui::Stroke::new(stroke_w, stroke_col));
-                            ui.painter().text(node_rect.center_top() + egui::vec2(0.0,6.0), egui::Align2::CENTER_TOP, format!("{}", i), egui::FontId::proportional(12.0), egui::Color32::WHITE);
+                            ui.painter().text(header_rect.center() + egui::vec2(0.0,0.0), egui::Align2::CENTER_CENTER, format!("{}", i), egui::FontId::proportional(12.0 * self.zoom), egui::Color32::WHITE);
 
                         // draw small pins on left (input) and right (output)
-                        let left_pin = egui::pos2(node_rect.left() + 8.0, node_rect.center().y);
-                        let right_pin = egui::pos2(node_rect.right() - 8.0, node_rect.center().y);
+                        let left_pin = egui::pos2(node_rect.left() + 8.0 * self.zoom, node_rect.center().y);
+                        let right_pin = egui::pos2(node_rect.right() - 8.0 * self.zoom, node_rect.center().y);
                         ui.painter().circle_filled(left_pin, 6.0, egui::Color32::from_rgb(200,200,200));
                         ui.painter().circle_filled(right_pin, 6.0, egui::Color32::from_rgb(200,200,200));
 
@@ -446,7 +526,7 @@ impl eframe::App for App {
                             memristor_sim::node_graph::NodeKind::Memristor { id, .. } => {
                                 // draw a zig-zag-like icon (approx with polyline)
                                 let ic = node_rect.center() - egui::vec2(0.0, 4.0);
-                                let pts = [ic + egui::vec2(-14.0, -6.0), ic + egui::vec2(-6.0, 6.0), ic + egui::vec2(0.0, -6.0), ic + egui::vec2(6.0, 6.0), ic + egui::vec2(14.0, -6.0)];
+                                let pts = [ic + egui::vec2(-14.0 * self.zoom, -6.0 * self.zoom), ic + egui::vec2(-6.0 * self.zoom, 6.0 * self.zoom), ic + egui::vec2(0.0, -6.0 * self.zoom), ic + egui::vec2(6.0 * self.zoom, 6.0 * self.zoom), ic + egui::vec2(14.0 * self.zoom, -6.0 * self.zoom)];
                                 ui.painter().line_segment([pts[0], pts[1]], egui::Stroke::new(2.0, egui::Color32::from_rgb(100,200,180)));
                                 ui.painter().line_segment([pts[1], pts[2]], egui::Stroke::new(2.0, egui::Color32::from_rgb(100,200,180)));
                                 ui.painter().line_segment([pts[2], pts[3]], egui::Stroke::new(2.0, egui::Color32::from_rgb(100,200,180)));
@@ -466,9 +546,9 @@ impl eframe::App for App {
                             if dn == i {
                                 let delta = editor_resp.drag_delta();
                                 if delta != egui::Vec2::ZERO {
-                                    // move node by drag delta
+                                    // move node by drag delta (account for zoom)
                                     let mut np = egui::pos2(self.node_positions[i][0], self.node_positions[i][1]);
-                                    np += delta;
+                                    np += delta / self.zoom;
                                     self.node_positions[i] = [np.x.max(0.0), np.y.max(0.0)];
                                 }
                                 if editor_resp.drag_released() {
@@ -493,11 +573,11 @@ impl eframe::App for App {
                         }
                     }
 
-                    // draw links between centers with arrowheads, animated hover glow, and labels
+                    // draw links between centers with cubic bezier curves, glow, and labels
                     for (li, l) in self.graph.links.iter().enumerate() {
                         if l.a < self.node_positions.len() && l.b < self.node_positions.len() {
-                            let a_pos = editor_rect.left_top() + egui::vec2(self.node_positions[l.a][0]+60.0, self.node_positions[l.a][1]+30.0);
-                            let b_pos = editor_rect.left_top() + egui::vec2(self.node_positions[l.b][0]+60.0, self.node_positions[l.b][1]+30.0);
+                            let a_pos = editor_rect.left_top() + egui::vec2(self.node_positions[l.a][0] * self.zoom + self.pan.x + 60.0 * self.zoom, self.node_positions[l.a][1] * self.zoom + self.pan.y + 30.0 * self.zoom);
+                            let b_pos = editor_rect.left_top() + egui::vec2(self.node_positions[l.b][0] * self.zoom + self.pan.x + 60.0 * self.zoom, self.node_positions[l.b][1] * self.zoom + self.pan.y + 30.0 * self.zoom);
                             // determine if this link is selected
                             let mut col = egui::Color32::from_rgb(200,200,90);
                             let mut w: f32 = 2.0;
@@ -530,24 +610,34 @@ impl eframe::App for App {
                             let sel_factor = if self.selected_link == Some(li) { 1.0 } else { 0.0 };
                             let strength = (0.15 * sel_factor) + (hover_factor * 0.85 * pulse);
 
-                            // glow (draw thicker translucent underlayer)
-                            if strength > 0.01 {
-                                let glow_w = w + 8.0 * strength;
-                                let mut glow_col = col;
-                                glow_col = egui::Color32::from_rgba_unmultiplied(glow_col.r(), glow_col.g(), glow_col.b(), (120.0 * strength) as u8);
-                                ui.painter().line_segment([a_pos, b_pos], egui::Stroke::new(glow_w, glow_col));
-                            }
-
-                            // main line
-                            let main_w = w + 2.0 * strength;
-                            ui.painter().line_segment([a_pos, b_pos], egui::Stroke::new(main_w, col));
-
-                            // draw arrowhead pointing to b_pos (solid)
+                            // glow (draw thicker translucent bezier behind)
                             let dir = b_pos - a_pos;
+                            let c1 = a_pos + egui::vec2(dir.x * 0.25, dir.y * 0.0);
+                            let c2 = b_pos - egui::vec2(dir.x * 0.25, dir.y * 0.0);
+                            // approximate cubic bezier by sampling points
+                            let steps = 24usize.max((12.0 * (1.0/self.zoom)) as usize);
+                            let mut bezier_pts: Vec<egui::Pos2> = Vec::with_capacity(steps + 1);
+                            for i in 0..=steps {
+                                let t = i as f32 / steps as f32;
+                                let it = 1.0 - t;
+                                let p = a_pos.to_vec2() * it*it*it
+                                    + c1.to_vec2() * 3.0*it*it*t
+                                    + c2.to_vec2() * 3.0*it*t*t
+                                    + b_pos.to_vec2() * t*t*t;
+                                bezier_pts.push(egui::pos2(p.x, p.y));
+                            }
+                            if strength > 0.01 {
+                                let glow_col = egui::Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), (80.0 * strength) as u8);
+                                ui.painter().add(egui::Shape::line(bezier_pts.clone(), egui::Stroke::new(w + 8.0 * strength, glow_col)));
+                            }
+                            let main_w = w + 2.0 * strength;
+                            ui.painter().add(egui::Shape::line(bezier_pts.clone(), egui::Stroke::new(main_w, col)));
+
+                            // draw arrowhead as small triangle
                             let len = (dir.x*dir.x + dir.y*dir.y).sqrt().max(1.0);
                             let nd = dir / len;
                             let perp = egui::vec2(-nd.y, nd.x);
-                            let ah = 10.0f32; // arrowhead length
+                            let ah = 8.0f32 * self.zoom; // arrowhead length
                             let p1 = b_pos - nd * ah + perp * (ah * 0.5);
                             let p2 = b_pos - nd * ah - perp * (ah * 0.5);
                             ui.painter().add(egui::Shape::convex_polygon(vec![b_pos, p1, p2], col, egui::Stroke::new(0.0, col)));
@@ -579,65 +669,76 @@ impl eframe::App for App {
                         }
                     }
                 });
-
-                ui.add_space(8.0);
-
-                // Plot column
-                ui.vertical(|ui| {
-                    let available = ui.available_size();
-                    let width = plot_w.max(320.0);
-                    let height = available.y.max(200.0).min(720.0);
-                    let (rect, _resp) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
-                    ui.painter().rect_filled(rect, 0.0, egui::Color32::from_rgb(24,26,30));
-
-                    if self.times.is_empty() {
-                        ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "No data yet", egui::FontId::proportional(18.0), egui::Color32::LIGHT_GRAY);
-                    } else {
-                        let t_min = *self.times.first().unwrap_or(&0.0);
-                        let t_max = *self.times.last().unwrap_or(&1.0);
-                        let mut v_min = self.node2.iter().cloned().fold(f64::INFINITY, f64::min);
-                        let mut v_max = self.node2.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                        if !v_min.is_finite() || !v_max.is_finite() { v_min = 0.0; v_max = 1.0; }
-                        let orig_span = v_max - v_min;
-                        if orig_span.abs() < 1e-12 { let m = (v_max.abs().max(1.0)) * 1e-3; v_min -= m; v_max += m; } else { let span = v_max - v_min; v_min -= 0.06 * span; v_max += 0.06 * span; }
-                        let v_range = (v_max - v_min).max(1e-9);
-                        let t_range = (t_max - t_min).max(1e-12);
-
-                        // vertical grid lines
-                        for i in 0..=4 { let fx = i as f32 / 4.0; let x = rect.left() + fx * rect.width(); ui.painter().line_segment([egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())], egui::Stroke::new(1.0, egui::Color32::from_rgb(50,50,55))); }
-
-                        let mut pts: Vec<egui::Pos2> = Vec::with_capacity(self.times.len());
-                        for (t, v) in self.times.iter().zip(self.node2.iter()) {
-                            let fx = ((*t - t_min) / t_range) as f32;
-                            let fy = ((*v - v_min) / v_range) as f32;
-                            let x = rect.left() + fx * rect.width();
-                            let y = rect.bottom() - fy * rect.height();
-                            pts.push(egui::pos2(x,y));
-                        }
-
-                        if pts.len() > 1 { ui.painter().add(egui::Shape::line(pts.clone(), egui::Stroke::new(3.0, egui::Color32::from_rgb(0,200,255)))); }
-                        for p in pts.iter().step_by((pts.len()/120).max(1)) { ui.painter().circle_filled(*p, 3.0, egui::Color32::from_rgb(0,200,255)); }
-                        if let (Some(f), Some(l)) = (pts.first(), pts.last()) { ui.painter().circle_filled(*f, 6.0, egui::Color32::from_rgb(0,255,0)); ui.painter().circle_filled(*l, 6.0, egui::Color32::from_rgb(255,0,0)); }
-
-                        if orig_span.abs() < 1e-9 {
-                            if let Some(&v0) = self.node2.first() {
-                                let fy0 = ((v0 - v_min) / v_range) as f32;
-                                let y0 = rect.bottom() - fy0 * rect.height();
-                                ui.painter().line_segment([egui::pos2(rect.left(), y0), egui::pos2(rect.right(), y0)], egui::Stroke::new(4.0, egui::Color32::from_rgb(255,200,0)));
-                                for p in pts.iter().step_by((pts.len()/40).max(1)) { ui.painter().circle_filled(*p, 6.0, egui::Color32::from_rgb(255,200,0)); }
-                            }
-                        }
-
-                        let dbg_show = 12usize.min(self.times.len()); let mut y_off = rect.top() + 8.0;
-                        for i in 0..dbg_show { let line = format!("{:.6}: {:.6e} st={:.3}", self.times[i], self.node2[i], self.m1_state[i]); ui.painter().text(rect.left_top() + egui::vec2(8.0, y_off - rect.top()), egui::Align2::LEFT_TOP, line, egui::FontId::proportional(12.0), egui::Color32::from_rgba_unmultiplied(220,220,220,230)); y_off += 14.0; }
-
-                        ui.painter().text(rect.right_top() - egui::vec2(8.0, -4.0), egui::Align2::RIGHT_TOP, format!("max={:.6}", v_max), egui::FontId::proportional(12.0), egui::Color32::LIGHT_GRAY);
-                        ui.painter().text(rect.right_bottom() - egui::vec2(8.0, 18.0), egui::Align2::RIGHT_BOTTOM, format!("min={:.6}", v_min), egui::FontId::proportional(12.0), egui::Color32::LIGHT_GRAY);
-                    }
-
-                    ui.painter().rect_stroke(rect, 2.0, egui::Stroke::new(1.0, egui::Color32::from_rgb(80,80,90)));
-                });
             });
+        });
+
+        // Right-side inspector (3D view + params)
+        egui::SidePanel::right("inspector").min_width(300.0).resizable(true).show(ctx, |ui| {
+            ui.heading("Inspector");
+            ui.separator();
+            // 3D-like memristor view (2D-painted cylinder that changes color based on state)
+            let state_s = self.m1_state.last().copied().unwrap_or(self.mem_state_init) as f32;
+            let view_size = egui::vec2(260.0, 160.0);
+            let (rect, _resp) = ui.allocate_exact_size(view_size, egui::Sense::hover());
+            ui.painter().rect_filled(rect, 8.0, egui::Color32::from_rgb(16,16,20));
+            // color mapping: s=0 -> dark red, s=1 -> bright yellow
+            let r = (255.0 * state_s) as u8;
+            let g = (200.0 * state_s) as u8;
+            let color = egui::Color32::from_rgb(r, g, 0);
+            // draw cylinder body
+            let body_rect = egui::Rect::from_min_max(rect.left_top() + egui::vec2(40.0, 30.0), rect.right_bottom() - egui::vec2(40.0, 30.0));
+            ui.painter().rect_filled(body_rect, 8.0, color);
+            // top/bottom ellipse
+            let top_center = egui::pos2((body_rect.left() + body_rect.right()) * 0.5, body_rect.top());
+            let bottom_center = egui::pos2((body_rect.left() + body_rect.right()) * 0.5, body_rect.bottom());
+            let top_rect = egui::Rect::from_center_size(top_center, egui::vec2(body_rect.width()*0.9, 12.0));
+            let bottom_rect = egui::Rect::from_center_size(bottom_center, egui::vec2(body_rect.width()*0.9, 12.0));
+            ui.painter().rect_filled(top_rect, 12.0, color);
+            ui.painter().rect_filled(bottom_rect, 12.0, egui::Color32::from_rgba_unmultiplied((r/2).max(10), (g/2).max(10), 0, 200));
+            ui.separator();
+            ui.label("VTEAM params:");
+            ui.add(egui::Slider::new(&mut self.vteam_von, -5.0..=0.0).text("v_on"));
+            ui.add(egui::Slider::new(&mut self.vteam_voff, 0.0..=5.0).text("v_off"));
+            ui.separator();
+            ui.label("Yakopcic params:");
+            ui.add(egui::Slider::new(&mut self.yak_a1, 0.0..=1e-1).text("a1"));
+            ui.add(egui::Slider::new(&mut self.yak_a2, 0.0..=1e-1).text("a2"));
+            ui.add(egui::Slider::new(&mut self.yak_b, 0.0..=10.0).text("b"));
+        });
+
+        // Bottom oscilloscope (full-width)
+        egui::TopBottomPanel::bottom("oscilloscope").min_height(200.0).resizable(true).show(ctx, |ui| {
+            ui.label("Oscilloscope (V(t), state)");
+            let available = ui.available_size();
+            let rect = ui.allocate_exact_size(egui::vec2(available.x, 200.0), egui::Sense::hover()).0;
+            ui.painter().rect_filled(rect, 0.0, egui::Color32::from_rgb(24,26,30));
+
+            if self.times.is_empty() {
+                ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "No data yet", egui::FontId::proportional(18.0), egui::Color32::LIGHT_GRAY);
+            } else {
+                let t_min = *self.times.first().unwrap_or(&0.0);
+                let t_max = *self.times.last().unwrap_or(&1.0);
+                let mut v_min = self.node2.iter().cloned().fold(f64::INFINITY, f64::min);
+                let mut v_max = self.node2.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                if !v_min.is_finite() || !v_max.is_finite() { v_min = 0.0; v_max = 1.0; }
+                let orig_span = v_max - v_min;
+                if orig_span.abs() < 1e-12 { let m = (v_max.abs().max(1.0)) * 1e-3; v_min -= m; v_max += m; } else { let span = v_max - v_min; v_min -= 0.06 * span; v_max += 0.06 * span; }
+                let v_range = (v_max - v_min).max(1e-9);
+                let t_range = (t_max - t_min).max(1e-12);
+
+                // vertical grid lines
+                for i in 0..=6 { let fx = i as f32 / 6.0; let x = rect.left() + fx * rect.width(); ui.painter().line_segment([egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())], egui::Stroke::new(1.0, egui::Color32::from_rgb(40,40,45))); }
+
+                let mut pts: Vec<egui::Pos2> = Vec::with_capacity(self.times.len());
+                for (t, v) in self.times.iter().zip(self.node2.iter()) {
+                    let fx = ((*t - t_min) / t_range) as f32;
+                    let fy = ((*v - v_min) / v_range) as f32;
+                    let x = rect.left() + fx * rect.width();
+                    let y = rect.bottom() - fy * rect.height();
+                    pts.push(egui::pos2(x,y));
+                }
+                if pts.len() > 1 { ui.painter().add(egui::Shape::line(pts.clone(), egui::Stroke::new(3.0, egui::Color32::from_rgb(0,200,255)))); }
+            }
         });
 
         if self.running { ctx.request_repaint_after(std::time::Duration::from_millis(100)); }
@@ -646,5 +747,5 @@ impl eframe::App for App {
 
 fn main() {
     let native_options = eframe::NativeOptions::default();
-    let _ = eframe::run_native("Memristor Simulator", native_options, Box::new(|_cc| Box::new(App::default())));
+    let _ = eframe::run_native("Memristor Simulator", native_options, Box::new(|cc| { configure_styles(&cc.egui_ctx); Box::new(App::default()) }));
 }
