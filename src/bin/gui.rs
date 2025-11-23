@@ -122,12 +122,7 @@ impl App {
         self.rx = Some(rx);
         self.cancel = Some(cancel_flag.clone());
 
-        let mem_templ = memristor_sim::Memristor {
-            id: "M1".into(), ron: self.mem_ron, roff: self.mem_roff,
-            state: self.mem_state_init, mu0: self.mem_mu0, n: self.mem_n,
-            window_p: self.mem_window_p, ithreshold: self.mem_ithreshold,
-            activation_e: 0.6, temperature: 300.0
-        };
+        let mem_templ = memristor_sim::Memristor::new(memristor_sim::HpTiO2Model::new("M1", self.mem_ron, self.mem_roff, self.mem_state_init));
         let vs_kind = if self.drive_is_sine {
             memristor_sim::mna::VoltageKind::Sine { amp: self.drive_amp, freq: self.drive_freq, phase: 0.0 }
         } else {

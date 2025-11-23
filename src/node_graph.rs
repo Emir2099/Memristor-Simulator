@@ -114,7 +114,8 @@ impl Graph {
                 mem_count += 1;
                 let net_idx = *net_map.get(&n.id).unwrap_or(&0);
                 let mem_id = format!("M{}", mem_count);
-                net.add(mna::Component::Memristor { id: mem_id.clone(), n1: net_idx, n2: 0, mem: crate::Memristor { id: mem_id.clone(), ron: *ron, roff: *roff, state: *state, mu0: *mu0, n: *expn, window_p: *window_p, ithreshold: *ithreshold, activation_e: 0.6, temperature: 300.0 } });
+                // default to HP/TiO2 model for node-graph-created memristors
+                net.add(mna::Component::Memristor { id: mem_id.clone(), n1: net_idx, n2: 0, mem: crate::Memristor::new(crate::HpTiO2Model::new(mem_id.clone(), *ron, *roff, *state)) });
                 // if there is a source, add R2 between source node (1) and this mem node, but only if nets differ
                 if let Some(_) = vs_node {
                     if net_idx != 1 {

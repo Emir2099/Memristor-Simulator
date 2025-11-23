@@ -31,7 +31,7 @@ impl fmt::Display for Component {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Component::Resistor { id, n1, n2, .. } => write!(f, "R {} {} {}\n", id, n1, n2),
-            Component::Memristor { id, n1, n2, mem } => write!(f, "M {} {} {} state={:.3}\n", id, n1, n2, mem.state),
+            Component::Memristor { id, n1, n2, mem } => write!(f, "M {} {} {} state={:.3}\n", id, n1, n2, mem.state()),
             Component::Capacitor { id, n1, n2, c } => write!(f, "C {} {} {}\n", id, n1, n2),
             Component::CurrentSource { id, n_plus, n_minus, i } => write!(f, "I {} {} {}\n", id, n_plus, n_minus),
             Component::VSource { id, n_plus, n_minus, kind } => write!(f, "V {} {} {} {:?}\n", id, n_plus, n_minus, kind),
@@ -95,26 +95,13 @@ impl Netlist {
             return Some(MnaResult { node_voltages: vec![0.0; n_nodes], vs_currents: Vec::new() });
         }
 
-        // helper: compute ds_dt given memristor params at arbitrary s and current i
-        let compute_ds_dt = |m: &Memristor, s: f64, current: f64| -> f64 {
-            if current.abs() <= m.ithreshold { return 0.0; }
-            let s_clamped = s.clamp(0.0, 1.0);
-            let two_x_m1 = 2.0 * s_clamped - 1.0;
-            let f_win = 1.0 - two_x_m1.abs().powf(2.0 * m.window_p);
-            let k_b_ev = 8.617333262145e-5_f64;
-            let temp_factor = (-m.activation_e / (k_b_ev * m.temperature)).exp();
-            let i_eff = (current.abs() - m.ithreshold).max(0.0).powf(m.n) * current.signum();
-            m.mu0 * temp_factor * i_eff * f_win
-        };
-
         // Inner solver: for a given voltage drop vdrop and previous state s_old, solve for s_new via fixed-point
         let solve_state_given_voltage = |m: &Memristor, vdrop: f64, s_old: f64, dt_local: f64| -> f64 {
             let mut s = s_old;
             for _iter in 0..12 {
-                let r = m.ron * s + m.roff * (1.0 - s);
+                let r = m.resistance_for_state(s);
                 let current = if r <= 0.0 { 0.0 } else { vdrop / r };
-                let ds = compute_ds_dt(m, s, current);
-                let s_next = (s_old + ds * dt_local).clamp(0.0, 1.0);
+                let s_next = m.predict_state(s, vdrop, current, dt_local);
                 if (s_next - s).abs() < 1e-8 { s = s_next; break; }
                 s = s_next;
             }
@@ -190,7 +177,7 @@ impl Netlist {
             let mut mem_s_guess: HashMap<usize, f64> = HashMap::new();
             for (ci, comp) in self.comps.iter().enumerate() {
                 if let Component::Memristor { n1: _, n2: _, mem, .. } = comp {
-                    mem_s_guess.insert(ci, mem.state);
+                    mem_s_guess.insert(ci, mem.state());
                 }
             }
 
@@ -200,7 +187,7 @@ impl Netlist {
                     let v1 = if *n1 == 0 { 0.0 } else { v_curr[*n1 - 1] };
                     let v2 = if *n2 == 0 { 0.0 } else { v_curr[*n2 - 1] };
                     let vdrop = v1 - v2;
-                    let s_old = mem.state;
+                    let s_old = mem.state();
                     let s_new = solve_state_given_voltage(mem, vdrop, s_old, dt);
                     mem_s_guess.insert(ci, s_new);
                 }
@@ -216,8 +203,8 @@ impl Netlist {
                         if *n1 != 0 && *n2 != 0 { let i = *n1 - 1; let j = *n2 - 1; a[i][j] -= g; a[j][i] -= g; }
                     }
                     Component::Memristor { n1, n2, mem, .. } => {
-                        let s_guess = *mem_s_guess.get(&ci).unwrap_or(&mem.state);
-                        let r_now = mem.ron * s_guess + mem.roff * (1.0 - s_guess);
+                        let s_guess = *mem_s_guess.get(&ci).unwrap_or(&mem.state());
+                        let r_now = mem.resistance_for_state(s_guess);
                         let g = if r_now <= 0.0 { 0.0 } else { 1.0 / r_now };
                         if *n1 != 0 { let i = *n1 - 1; a[i][i] += g; }
                         if *n2 != 0 { let j = *n2 - 1; a[j][j] += g; }
@@ -277,9 +264,9 @@ impl Netlist {
                         let v1 = if *n1 == 0 { 0.0 } else { node_voltages[*n1] };
                         let v2 = if *n2 == 0 { 0.0 } else { node_voltages[*n2] };
                         let vdrop = v1 - v2;
-                        let s_old = mem.state;
+                        let s_old = mem.state();
                         let s_new = solve_state_given_voltage(mem, vdrop, s_old, dt);
-                        mem.state = s_new;
+                        mem.set_state(s_new);
                     }
                 }
 

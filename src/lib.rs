@@ -7,24 +7,170 @@ pub struct Resistor {
     pub r: f64,
 }
 
-#[derive(Clone, Debug)]
+// Trait-based memristor models. This lets us swap models (HP/TiO2, VTEAM, Yakopcic, etc.)
+pub trait MemristorModel: Send + Sync {
+    fn id(&self) -> &str;
+    fn set_id(&mut self, id: String);
+    fn state(&self) -> f64;
+    fn set_state(&mut self, s: f64);
+
+    // resistance at the model's current state
+    fn resistance(&self) -> f64;
+
+    // resistance for an arbitrary state (used in inner solves)
+    fn resistance_for_state(&self, s: f64) -> f64;
+
+    // Given a candidate old state, voltage across the device and current through it,
+    // predict the next state after timestep dt (non-mutating prediction used in inner loops).
+    fn predict_state(&self, s_old: f64, vdrop: f64, current: f64, dt: f64) -> f64;
+
+    // clone into a boxed trait object
+    fn box_clone(&self) -> Box<dyn MemristorModel>;
+}
+
+impl Clone for Box<dyn MemristorModel> {
+    fn clone(&self) -> Box<dyn MemristorModel> { self.box_clone() }
+}
+
+#[derive(Clone)]
 pub struct Memristor {
+    pub inner: Box<dyn MemristorModel>,
+}
+
+impl Memristor {
+    pub fn new<M: MemristorModel + 'static>(m: M) -> Self { Memristor { inner: Box::new(m) } }
+
+    pub fn id(&self) -> &str { self.inner.id() }
+    pub fn state(&self) -> f64 { self.inner.state() }
+    pub fn set_state(&mut self, s: f64) { self.inner.set_state(s); }
+    pub fn resistance(&self) -> f64 { self.inner.resistance() }
+    pub fn resistance_for_state(&self, s: f64) -> f64 { self.inner.resistance_for_state(s) }
+    pub fn predict_state(&self, s_old: f64, vdrop: f64, current: f64, dt: f64) -> f64 { self.inner.predict_state(s_old, vdrop, current, dt) }
+}
+
+// --- HP TiO2 (linear drift) model ---
+#[derive(Clone)]
+pub struct HpTiO2Model {
     pub id: String,
     pub ron: f64,
     pub roff: f64,
-    pub state: f64, // between 0..1
-    // base mobility-like prefactor (A^-1 s^-1)
+    pub state: f64, // 0..1
     pub mu0: f64,
-    // nonlinearity exponent on current (|i|-ith)^n
-    pub n: f64,
-    // window exponent for boundary enforcement
     pub window_p: f64,
-    // current threshold below which state doesn't change
     pub ithreshold: f64,
-    // activation energy (eV) for temperature dependence (Arrhenius)
     pub activation_e: f64,
-    // temperature in Kelvin
     pub temperature: f64,
+}
+
+impl HpTiO2Model {
+    pub fn new(id: impl Into<String>, ron: f64, roff: f64, state: f64) -> Self {
+        HpTiO2Model { id: id.into(), ron, roff, state, mu0: 1e3, window_p: 1.0, ithreshold: 0.0, activation_e: 0.6, temperature: 300.0 }
+    }
+}
+
+impl MemristorModel for HpTiO2Model {
+    fn id(&self) -> &str { &self.id }
+    fn set_id(&mut self, id: String) { self.id = id; }
+    fn state(&self) -> f64 { self.state }
+    fn set_state(&mut self, s: f64) { self.state = s.clamp(0.0, 1.0); }
+    fn resistance(&self) -> f64 { self.resistance_for_state(self.state) }
+    fn resistance_for_state(&self, s: f64) -> f64 { let s = s.clamp(0.0,1.0); self.ron * s + self.roff * (1.0 - s) }
+    fn predict_state(&self, s_old: f64, _vdrop: f64, current: f64, dt: f64) -> f64 {
+        if current.abs() <= self.ithreshold { return s_old.clamp(0.0,1.0); }
+        let s = s_old.clamp(0.0,1.0);
+        let two_x_m1 = 2.0 * s - 1.0;
+        let f_win = 1.0 - two_x_m1.abs().powf(2.0 * self.window_p);
+        let k_b_ev = 8.617333262145e-5_f64;
+        let temp_factor = (-self.activation_e / (k_b_ev * self.temperature)).exp();
+        let i_eff = (current.abs() - self.ithreshold).max(0.0).powf(1.0) * current.signum();
+        let ds_dt = self.mu0 * temp_factor * i_eff * f_win;
+        (s_old + ds_dt * dt).clamp(0.0, 1.0)
+    }
+    fn box_clone(&self) -> Box<dyn MemristorModel> { Box::new(self.clone()) }
+}
+
+// --- VTEAM model (voltage-threshold adaptive memristor) ---
+#[derive(Clone)]
+pub struct VTeamModel {
+    pub id: String,
+    pub ron: f64,
+    pub roff: f64,
+    pub state: f64,
+    pub v_on: f64,
+    pub v_off: f64,
+    pub k_on: f64,
+    pub k_off: f64,
+    pub window_p: f64,
+}
+
+impl VTeamModel {
+    pub fn new(id: impl Into<String>, ron: f64, roff: f64, state: f64) -> Self {
+        VTeamModel { id: id.into(), ron, roff, state, v_on: 1.0, v_off: -1.0, k_on: 1e-3, k_off: 1e-3, window_p: 1.0 }
+    }
+}
+
+impl MemristorModel for VTeamModel {
+    fn id(&self) -> &str { &self.id }
+    fn set_id(&mut self, id: String) { self.id = id; }
+    fn state(&self) -> f64 { self.state }
+    fn set_state(&mut self, s: f64) { self.state = s.clamp(0.0,1.0); }
+    fn resistance(&self) -> f64 { self.resistance_for_state(self.state) }
+    fn resistance_for_state(&self, s: f64) -> f64 { let s = s.clamp(0.0,1.0); self.ron * s + self.roff * (1.0 - s) }
+    fn predict_state(&self, s_old: f64, vdrop: f64, _current: f64, dt: f64) -> f64 {
+        // VTEAM: state changes only when |v| crosses thresholds
+        let mut ds_dt = 0.0;
+        if vdrop > self.v_on {
+            ds_dt = self.k_on * (vdrop - self.v_on);
+        } else if vdrop < self.v_off {
+            ds_dt = self.k_off * (vdrop - self.v_off);
+        }
+        // window to slow at boundaries
+        let s = s_old.clamp(0.0,1.0);
+        let two_x_m1 = 2.0 * s - 1.0;
+        let f_win = 1.0 - two_x_m1.abs().powf(2.0 * self.window_p);
+        (s_old + ds_dt * f_win * dt).clamp(0.0, 1.0)
+    }
+    fn box_clone(&self) -> Box<dyn MemristorModel> { Box::new(self.clone()) }
+}
+
+// --- Yakopcic model (simplified variant) ---
+#[derive(Clone)]
+pub struct YakopcicModel {
+    pub id: String,
+    pub ron: f64,
+    pub roff: f64,
+    pub state: f64,
+    pub alpha_p: f64,
+    pub beta_p: f64,
+    pub alpha_n: f64,
+    pub beta_n: f64,
+    pub p: f64,
+}
+
+impl YakopcicModel {
+    pub fn new(id: impl Into<String>, ron: f64, roff: f64, state: f64) -> Self {
+        YakopcicModel { id: id.into(), ron, roff, state, alpha_p: 1e-3, beta_p: 1.0, alpha_n: 1e-3, beta_n: 1.0, p: 1.0 }
+    }
+}
+
+impl MemristorModel for YakopcicModel {
+    fn id(&self) -> &str { &self.id }
+    fn set_id(&mut self, id: String) { self.id = id; }
+    fn state(&self) -> f64 { self.state }
+    fn set_state(&mut self, s: f64) { self.state = s.clamp(0.0,1.0); }
+    fn resistance(&self) -> f64 { self.resistance_for_state(self.state) }
+    fn resistance_for_state(&self, s: f64) -> f64 { let s = s.clamp(0.0,1.0); self.ron * s + self.roff * (1.0 - s) }
+    fn predict_state(&self, s_old: f64, vdrop: f64, _current: f64, dt: f64) -> f64 {
+        // simplified Yakopcic-like dynamics: asymmetric sinh-based rates
+        let mut ds_dt = 0.0;
+        if vdrop > 0.0 {
+            ds_dt = self.alpha_p * (vdrop * self.beta_p).sinh() * (1.0 - s_old).powf(self.p);
+        } else if vdrop < 0.0 {
+            ds_dt = -self.alpha_n * ((-vdrop) * self.beta_n).sinh() * s_old.powf(self.p);
+        }
+        (s_old + ds_dt * dt).clamp(0.0, 1.0)
+    }
+    fn box_clone(&self) -> Box<dyn MemristorModel> { Box::new(self.clone()) }
 }
 
 #[derive(Clone)]
@@ -39,7 +185,7 @@ impl fmt::Debug for Component {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Component::R(r) => write!(f, "R({}:{:.3}Ω)", r.id, r.r),
-            Component::M(m) => write!(f, "M({}: state={:.3})", m.id, m.state),
+            Component::M(m) => write!(f, "M({}: state={:.3})", m.id(), m.state()),
             Component::Series(v) => write!(f, "Series({} items)", v.len()),
             Component::Parallel(v) => write!(f, "Parallel({} items)", v.len()),
         }
@@ -53,36 +199,29 @@ impl Resistor {
 }
 
 impl Memristor {
-    pub fn resistance(&self) -> f64 {
-        // linear interpolation between ron (state=1) and roff (state=0)
-        let s = self.state.clamp(0.0, 1.0);
-        self.ron * s + self.roff * (1.0 - s)
+    // Mutating state update using the voltage across the device (v = vdrop)
+    // This computes current = v / R(s) then uses the model's predictor to step the state.
+    pub fn update_state_by_voltage(&mut self, vdrop: f64, dt: f64) {
+        let s_old = self.state();
+        let r_now = self.resistance_for_state(s_old).max(1e-300);
+        let current = if r_now.is_infinite() { 0.0 } else { vdrop / r_now };
+        let s_new = self.predict_state(s_old, vdrop, current, dt);
+        self.set_state(s_new);
     }
 
-    pub fn update_state(&mut self, current: f64, dt: f64) {
-        // Ionic drift model with nonlinear mobility and temperature dependence.
-        // If current below threshold, no change.
-        if current.abs() <= self.ithreshold {
-            return;
-        }
+    // Mutating update by providing current directly
+    pub fn update_state_by_current(&mut self, current: f64, dt: f64) {
+        let s_old = self.state();
+        let s_new = self.predict_state(s_old, 0.0, current, dt);
+        self.set_state(s_new);
+    }
 
-        let s = self.state.clamp(0.0, 1.0);
-        // Joglekar-like window to slow change near boundaries
-        let two_x_m1 = 2.0 * s - 1.0;
-        let f_win = 1.0 - two_x_m1.abs().powf(2.0 * self.window_p);
+    pub fn set_id(&mut self, id: String) { self.inner.set_id(id); }
+}
 
-        // effective mobility (Arrhenius temperature dependence)
-        // k_B in eV/K is ~8.617333262145e-5
-        let k_b_ev = 8.617333262145e-5_f64;
-        let temp_factor = (-self.activation_e / (k_b_ev * self.temperature)).exp();
-
-        // nonlinear current dependence: (|i|-ith)^n * sign(i)
-        let i_eff = (current.abs() - self.ithreshold).max(0.0).powf(self.n) * current.signum();
-
-        // state derivative
-        let ds_dt = self.mu0 * temp_factor * i_eff * f_win;
-
-        self.state = (self.state + ds_dt * dt).clamp(0.0, 1.0);
+impl std::fmt::Debug for Memristor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Memristor({}: state={:.6})", self.id(), self.state())
     }
 }
 
@@ -122,10 +261,10 @@ impl Component {
             }
             Component::M(m) => {
                 let r_now = m.resistance();
-                let i = voltage / r_now;
-                // update state using current
-                m.update_state(i, dt);
-                rec.record(path, voltage, i, Some(m.state));
+                let i = if r_now == 0.0 { 0.0 } else { voltage / r_now };
+                // update state using voltage across device (mutates model)
+                m.update_state_by_voltage(voltage, dt);
+                rec.record(path, voltage, i, Some(m.state()));
                 i
             }
             Component::Series(items) => {
@@ -241,8 +380,8 @@ pub fn run_mna_example_csv(tstop: f64, dt: f64) -> String {
     let mut net = mna::Netlist::new();
     // R1 between node 1 and ground (1k)
     net.add(mna::Component::Resistor { id: "R1".into(), n1: 1, n2: 0, r: 1e3 });
-    // Memristor M1 between node 2 and ground
-    net.add(mna::Component::Memristor { id: "M1".into(), n1: 2, n2: 0, mem: Memristor { id: "M1".into(), ron: 100.0, roff: 16000.0, state: 0.1, mu0: 1e3, n: 1.0, window_p: 1.0, ithreshold: 0.0, activation_e: 0.6, temperature: 300.0 } });
+    // Memristor M1 between node 2 and ground (HP/TiO2 default for example)
+    net.add(mna::Component::Memristor { id: "M1".into(), n1: 2, n2: 0, mem: Memristor::new(HpTiO2Model::new("M1", 100.0, 16000.0, 0.1)) });
     // Series branch: R2 (2k) between node1 and node2
     net.add(mna::Component::Resistor { id: "R2".into(), n1: 1, n2: 2, r: 2e3 });
     // Voltage source between node 0 and node 1 (drive across R1+branch)
@@ -262,7 +401,7 @@ pub fn run_mna_example_csv(tstop: f64, dt: f64) -> String {
             let mut m1_state = 0.0;
             for c in &net.comps {
                 if let mna::Component::Memristor { id, mem, .. } = c {
-                    if id == "M1" { m1_state = mem.state; }
+                    if id == "M1" { m1_state = mem.state(); }
                 }
             }
             s.push_str(&format!("{:.9},{:.6e},{:.6e},{:.6e},{:.6}\n", t, v0, v1, v2, m1_state));
@@ -291,7 +430,7 @@ pub fn run_mna_stream(
     let mut net = mna::Netlist::new();
     net.add(mna::Component::Resistor { id: "R1".into(), n1: 1, n2: 0, r: 1e3 });
     let mut mem = mem_template.clone();
-    mem.id = "M1".into();
+    mem.set_id("M1".into());
     net.add(mna::Component::Memristor { id: "M1".into(), n1: 2, n2: 0, mem });
     net.add(mna::Component::Resistor { id: "R2".into(), n1: 1, n2: 2, r: 2e3 });
     net.add(mna::Component::VSource { id: "V1".into(), n_plus: 1, n_minus: 0, kind: vs_kind });
@@ -312,7 +451,7 @@ pub fn run_mna_stream(
             let mut m1_state = 0.0;
             for c in &net.comps {
                 if let mna::Component::Memristor { id, mem, .. } = c {
-                    if id == "M1" { m1_state = mem.state; }
+                    if id == "M1" { m1_state = mem.state(); }
                 }
             }
             // ignore send errors (receiver dropped)
@@ -347,7 +486,7 @@ pub fn run_mna_stream_from_netlist(
             let mut m_state = 0.0;
             for c in &net.comps {
                 if let crate::mna::Component::Memristor { id, mem, .. } = c {
-                    if id == &mem_id { m_state = mem.state; }
+                    if id == &mem_id { m_state = mem.state(); }
                 }
             }
             let _ = tx.send((t, v_mon, m_state));
