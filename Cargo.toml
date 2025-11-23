@@ -18,5 +18,8 @@ pollster = { version = "0.3", optional = true }
 
 # ensure a compatible wgpu version is available for eframe's wgpu feature
 
+# debug image dumping for GPU readback verification
+image = "0.24"
+
 [features]
 gpu_view = ["three-d", "wgpu", "pollster"]

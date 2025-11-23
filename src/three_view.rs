@@ -459,7 +459,9 @@ fn softshadow(ro: vec3<f32>, rd: vec3<f32>, k: f32) -> f32 {
         let (tx, rx) = std::sync::mpsc::channel();
         println!("three_view: mapping readback buffer");
         slice.map_async(wgpu::MapMode::Read, move |res| { let _ = tx.send(res); });
-        match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+        // Poll the device to ensure the map_async callback is invoked on this thread
+        self.device.poll(wgpu::Maintain::Wait);
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
             Ok(Ok(())) => { println!("three_view: mapping completed"); },
             Ok(Err(e)) => { println!("three_view: mapping error: {:?}", e); return None; },
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => { println!("three_view: mapping timed out"); return None; },
@@ -478,6 +480,31 @@ fn softshadow(ro: vec3<f32>, rd: vec3<f32>, k: f32) -> f32 {
         // unmap buffer
         drop(data);
         dst_buf.unmap();
+
+        // Diagnostic: log readback size and a small sample of bytes
+        println!("three_view: readback pixels len={}", pixels.len());
+        let sample_len = pixels.len().min(32);
+        let sample_bytes: Vec<String> = pixels.iter().take(sample_len).map(|b| format!("{:02x}", b)).collect();
+        println!("three_view: sample bytes: {}", sample_bytes.join(" "));
+
+        // Optional: write a debug PNG to target/three_view_debug.png so we can inspect the output
+        if let Err(e) = (|| -> Result<(), Box<dyn std::error::Error>> {
+            use image::{ImageBuffer, Rgba};
+            let path = std::path::Path::new("target/three_view_debug.png");
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            // ImageBuffer::from_raw takes ownership of the pixel vec when successful
+            if let Some(img_buf) = ImageBuffer::<Rgba<u8>, _>::from_raw(w, h, pixels.clone()) {
+                img_buf.save(path)?;
+                println!("three_view: wrote debug PNG to {:?}", path);
+            } else {
+                println!("three_view: failed to create ImageBuffer from raw pixels (size mismatch)");
+            }
+            Ok(())
+        })() {
+            println!("three_view: error writing debug PNG: {}", e);
+        }
 
         // Build egui::ColorImage from RGBA bytes
         Some(egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &pixels))

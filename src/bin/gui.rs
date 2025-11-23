@@ -58,6 +58,11 @@ struct App {
     selected_model_choice: usize,
     // embedded 3D view renderer (optional)
     three_view: Option<three_view::ThreeViewRenderer>,
+    // editor helpers
+    connect_mode: bool,
+    connect_src: Option<usize>,
+    // dragging a link from a node's output pin
+    link_dragging: bool,
 }
 
 impl Default for App {
@@ -105,6 +110,9 @@ impl Default for App {
             model_choices: vec!["HP".into(), "VTEAM".into(), "YAKOPCIC".into()],
             selected_model_choice: 0,
             three_view: None,
+            connect_mode: false,
+            connect_src: None,
+            link_dragging: false,
         };
 
         // try to load saved node positions
@@ -465,12 +473,14 @@ impl eframe::App for App {
                     if ui.small_button("+").clicked() { self.zoom = (self.zoom * 1.1).min(2.0); }
                     ui.add_space(10.0);
                     if ui.small_button("Reset View").clicked() { self.pan = egui::vec2(0.0, 0.0); self.zoom = 1.0; }
+                    ui.add_space(6.0);
+                    ui.checkbox(&mut self.connect_mode, "Connect");
                 });
             });
             ui.add_space(4.0);
 
             let height = (available.y - 40.0).max(300.0);
-            let (editor_rect, _resp) = ui.allocate_exact_size(egui::vec2(available.x, height), egui::Sense::click());
+            let (editor_rect, _resp) = ui.allocate_exact_size(egui::vec2(available.x, height), egui::Sense::click_and_drag());
             
             // draw blueprint grid background (respect pan/zoom)
             let grid_color = egui::Color32::from_rgb(30, 36, 44);
@@ -530,6 +540,11 @@ impl eframe::App for App {
                 ui.painter().circle_filled(left_pin, 6.0, egui::Color32::from_rgb(200,200,200));
                 ui.painter().circle_filled(right_pin, 6.0, egui::Color32::from_rgb(200,200,200));
 
+                // If this node is the current connect source, draw an outline to indicate it
+                if self.connect_src == Some(i) {
+                    ui.painter().rect_stroke(node_rect.shrink(-2.0), 10.0, egui::Stroke::new(3.0, egui::Color32::from_rgb(0,200,120)));
+                }
+
                 // icon/text per kind
                 match &n.kind {
                     memristor_sim::node_graph::NodeKind::VSource { id, .. } => {
@@ -554,8 +569,21 @@ impl eframe::App for App {
                 // detect drag start on editor area
                 let inside = pointer_pos.map_or(false, |p| node_rect.contains(p));
                 if editor_resp.drag_started() && inside {
-                    self.dragging_node = Some(i);
-                    if let Some(pp) = pointer_pos { self.drag_offset = pp.to_vec2() - top_left.to_vec2(); }
+                    // If drag started near the right pin, interpret as "link drag" (create link by dragging out)
+                    if let Some(pp) = pointer_pos {
+                        // compute actual distance to right_pin
+                        let dx = pp.x - right_pin.x;
+                        let dy = pp.y - right_pin.y;
+                        let dist = (dx*dx + dy*dy).sqrt();
+                        if dist < 14.0 * self.zoom {
+                            // begin link dragging from this node; record it as last_dragged for later link creation
+                            self.link_dragging = true;
+                            last_dragged = Some(i);
+                        } else {
+                            self.dragging_node = Some(i);
+                            self.drag_offset = pp.to_vec2() - top_left.to_vec2();
+                        }
+                    }
                 }
                 
                 // Handle pan with middle mouse or space+drag
@@ -594,6 +622,24 @@ impl eframe::App for App {
                             self.dragging_node = None;
                         }
                     }
+                }
+                // If link-dragging was started from this node, handle drag stop here as well
+                if self.link_dragging && editor_resp.drag_stopped() {
+                    // if released over some other node, create a link
+                    if let Some(pp) = pointer_pos {
+                        for (j, _m) in self.graph.nodes.iter().enumerate() {
+                            if j != i {
+                                let other_top = editor_rect.left_top() + egui::vec2(self.node_positions[j][0] * self.zoom + self.pan.x, self.node_positions[j][1] * self.zoom + self.pan.y);
+                                let other_rect = egui::Rect::from_min_size(other_top, egui::vec2(120.0,60.0) * self.zoom);
+                                if other_rect.contains(pp) {
+                                    released_over = Some(j);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    // link creation will be handled after the loop using last_dragged and released_over
+                    self.link_dragging = false;
                 }
             }
 
@@ -679,6 +725,28 @@ impl eframe::App for App {
                 }
             }
 
+            // If currently dragging a link from a node's output, draw a temporary preview from source -> cursor
+            if self.link_dragging {
+                if let Some(src) = last_dragged {
+                    if src < self.node_positions.len() {
+                        let a_pos = editor_rect.left_top() + egui::vec2(self.node_positions[src][0] * self.zoom + self.pan.x + 60.0 * self.zoom, self.node_positions[src][1] * self.zoom + self.pan.y + 30.0 * self.zoom);
+                        if let Some(pp) = pointer_pos {
+                            // simple straight preview line with arrow
+                            ui.painter().line_segment([a_pos, pp], egui::Stroke::new(2.5, egui::Color32::from_rgb(220,200,60)));
+                            // small arrow at tip
+                            let dir = pp - a_pos;
+                            let len = (dir.x*dir.x + dir.y*dir.y).sqrt().max(1.0);
+                            let nd = dir / len;
+                            let perp = egui::vec2(-nd.y, nd.x);
+                            let ah = 8.0f32 * self.zoom;
+                            let p1 = pp - nd * ah + perp * (ah * 0.5);
+                            let p2 = pp - nd * ah - perp * (ah * 0.5);
+                            ui.painter().add(egui::Shape::convex_polygon(vec![pp, p1, p2], egui::Color32::from_rgb(220,200,60), egui::Stroke::new(0.0, egui::Color32::from_rgb(220,200,60))));
+                        }
+                    }
+                }
+            }
+
             if let Some(j) = released_over {
                 // create link from last-dragged node -> j (fall back to selected_node)
                 if let Some(i) = last_dragged.or(self.selected_node) {
@@ -695,21 +763,37 @@ impl eframe::App for App {
                 self.zoom = (self.zoom * zoom_factor).clamp(0.3, 2.0);
             }
             
-            // click selection: if editor area was clicked (no drag), set selected_node
+            // click selection / connect-mode: if editor area was clicked (no drag), set selected_node or handle connect flow
             if editor_resp.clicked() && self.dragging_node.is_none() {
                 if let Some(pp) = pointer_pos {
                     let mut found = false;
                     for (i, _n) in self.graph.nodes.iter().enumerate() {
                         let top = editor_rect.left_top() + egui::vec2(self.node_positions[i][0] * self.zoom + self.pan.x, self.node_positions[i][1] * self.zoom + self.pan.y);
                         let rect = egui::Rect::from_min_size(top, egui::vec2(120.0,60.0) * self.zoom);
-                        if rect.contains(pp) { 
-                            self.selected_node = Some(i); 
+                        if rect.contains(pp) {
                             found = true;
-                            break; 
+                            // If connect mode is enabled, perform click-to-connect: click first node to select source, click second to create link
+                            if self.connect_mode {
+                                if let Some(src) = self.connect_src {
+                                    if src != i {
+                                        self.graph.add_link(src, i);
+                                    }
+                                    self.connect_src = None; // reset after connecting
+                                } else {
+                                    self.connect_src = Some(i);
+                                }
+                                self.selected_node = Some(i);
+                            } else {
+                                // normal selection
+                                self.selected_node = Some(i);
+                            }
+                            break;
                         }
                     }
                     if !found {
-                        self.selected_node = None;
+                        // clicked empty space - clear selection or cancel connect source depending on mode
+                        if self.connect_mode { self.connect_src = None; }
+                        else { self.selected_node = None; }
                     }
                 }
             }
