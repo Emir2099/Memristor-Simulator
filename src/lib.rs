@@ -1,6 +1,7 @@
 use std::fmt;
 pub mod node_graph;
 pub mod models;
+pub mod three_view;
 
 #[derive(Clone)]
 pub struct Resistor {

@@ -32,8 +32,8 @@ impl fmt::Display for Component {
         match self {
             Component::Resistor { id, n1, n2, .. } => write!(f, "R {} {} {}\n", id, n1, n2),
             Component::Memristor { id, n1, n2, mem } => write!(f, "M {} {} {} state={:.3}\n", id, n1, n2, mem.state()),
-            Component::Capacitor { id, n1, n2, c } => write!(f, "C {} {} {}\n", id, n1, n2),
-            Component::CurrentSource { id, n_plus, n_minus, i } => write!(f, "I {} {} {}\n", id, n_plus, n_minus),
+            Component::Capacitor { id, n1, n2, .. } => write!(f, "C {} {} {}\n", id, n1, n2),
+            Component::CurrentSource { id, n_plus, n_minus, .. } => write!(f, "I {} {} {}\n", id, n_plus, n_minus),
             Component::VSource { id, n_plus, n_minus, kind } => write!(f, "V {} {} {} {:?}\n", id, n_plus, n_minus, kind),
         }
     }
@@ -110,32 +110,60 @@ impl Netlist {
 
         // Initial guess: solve linear problem using current mem resistances (explicit-like) to get starting voltages
         // Build system A0 * V0 = b0
-        let mut flat0 = Vec::new();
+        // Use pre-allocated vectors to reduce allocations
+        let mut flat0 = Vec::with_capacity(n * n);
         let mut v_guess = vec![0.0f64; n_var_nodes];
         {
-            let mut a0 = vec![vec![0.0; n]; n];
+            // Pre-allocate matrix as flat array for better cache performance
+            let mut a0 = vec![0.0; n * n];
             let mut b0 = vec![0.0; n];
             let mut vs_map = Vec::new();
             for (ci, comp) in self.comps.iter().enumerate() {
                 match comp {
                     Component::Resistor { n1, n2, r, .. } => {
                         let g = 1.0 / *r;
-                        if *n1 != 0 { let i = *n1 - 1; a0[i][i] += g; }
-                        if *n2 != 0 { let j = *n2 - 1; a0[j][j] += g; }
-                        if *n1 != 0 && *n2 != 0 { let i = *n1 - 1; let j = *n2 - 1; a0[i][j] -= g; a0[j][i] -= g; }
+                        if *n1 != 0 { let i = *n1 - 1; a0[i * n + i] += g; }
+                        if *n2 != 0 { let j = *n2 - 1; a0[j * n + j] += g; }
+                        if *n1 != 0 && *n2 != 0 { 
+                            let i = *n1 - 1; 
+                            let j = *n2 - 1; 
+                            a0[i * n + j] -= g; 
+                            a0[j * n + i] -= g; 
+                        }
                     }
                     Component::Memristor { n1, n2, mem, .. } => {
                         let r_now = mem.resistance();
                         let g = if r_now <= 0.0 { 0.0 } else { 1.0 / r_now };
-                        if *n1 != 0 { let i = *n1 - 1; a0[i][i] += g; }
-                        if *n2 != 0 { let j = *n2 - 1; a0[j][j] += g; }
-                        if *n1 != 0 && *n2 != 0 { let i = *n1 - 1; let j = *n2 - 1; a0[i][j] -= g; a0[j][i] -= g; }
+                        if *n1 != 0 { let i = *n1 - 1; a0[i * n + i] += g; }
+                        if *n2 != 0 { let j = *n2 - 1; a0[j * n + j] += g; }
+                        if *n1 != 0 && *n2 != 0 { 
+                            let i = *n1 - 1; 
+                            let j = *n2 - 1; 
+                            a0[i * n + j] -= g; 
+                            a0[j * n + i] -= g; 
+                        }
                     }
                     Component::Capacitor { id: _, n1, n2, c } => {
                         let g = *c / dt;
                         let vprev = *self.cap_vprev.get(&ci).unwrap_or(&0.0);
-                        if *n1 != 0 { let i = *n1 - 1; a0[i][i] += g; if *n2 != 0 { let j = *n2 - 1; a0[i][j] -= g; } b0[*n1 - 1] += g * vprev; }
-                        if *n2 != 0 { let j = *n2 - 1; a0[j][j] += g; if *n1 != 0 { let i = *n1 - 1; a0[j][i] -= g; } b0[*n2 - 1] -= g * vprev; }
+                        if *n1 != 0 { 
+                            let i = *n1 - 1; 
+                            a0[i * n + i] += g; 
+                            if *n2 != 0 { 
+                                let j = *n2 - 1; 
+                                a0[i * n + j] -= g; 
+                            } 
+                            b0[i] += g * vprev; 
+                        }
+                        if *n2 != 0 { 
+                            let j = *n2 - 1; 
+                            a0[j * n + j] += g; 
+                            if *n1 != 0 { 
+                                let i = *n1 - 1; 
+                                a0[j * n + i] -= g; 
+                            } 
+                            b0[j] -= g * vprev; 
+                        }
                     }
                     Component::CurrentSource { id: _, n_plus, n_minus, i } => {
                         if *n_plus != 0 { b0[*n_plus - 1] -= *i; }
@@ -147,14 +175,21 @@ impl Netlist {
             for (k, &ci) in vs_map.iter().enumerate() {
                 let vs_col = n_var_nodes + k;
                 if let Component::VSource { n_plus, n_minus, kind, .. } = &self.comps[ci] {
-                    if *n_plus != 0 { let i = *n_plus - 1; a0[i][vs_col] += 1.0; a0[vs_col][i] += 1.0; }
-                    if *n_minus != 0 { let j = *n_minus - 1; a0[j][vs_col] -= 1.0; a0[vs_col][j] -= 1.0; }
+                    if *n_plus != 0 { 
+                        let i = *n_plus - 1; 
+                        a0[i * n + vs_col] += 1.0; 
+                        a0[vs_col * n + i] += 1.0; 
+                    }
+                    if *n_minus != 0 { 
+                        let j = *n_minus - 1; 
+                        a0[j * n + vs_col] -= 1.0; 
+                        a0[vs_col * n + j] -= 1.0; 
+                    }
                     b0[vs_col] = kind.value_at(t);
                 }
             }
-            // flatten and solve
-            flat0.reserve(n * n);
-            for row in &a0 { for &v in row.iter() { flat0.push(v); } }
+            // Already flat, just copy
+            flat0.extend_from_slice(&a0);
             let a_mat0 = DMatrix::from_row_slice(n, n, &flat0);
             let b_vec0 = DVector::from_row_slice(&b0);
             let lu0 = LU::new(a_mat0);
@@ -166,11 +201,15 @@ impl Netlist {
         let mut v_curr = v_guess.clone();
         let mut vs_currents = vec![0.0f64; n_vs];
 
+        // Pre-allocate matrix storage for NR iterations (reuse across iterations)
+        let mut a_flat = vec![0.0; n * n];
+        let mut b = vec![0.0; n];
+        
         // Newton-Raphson on voltages
         for _nr_iter in 0..12 {
-            // per-iteration assembly
-            let mut a = vec![vec![0.0; n]; n];
-            let mut b = vec![0.0; n];
+            // Clear matrix and RHS for this iteration
+            a_flat.fill(0.0);
+            b.fill(0.0);
             let mut vs_map = Vec::new();
 
             // For memristor state guesses we will compute provisional s for the current v_curr
@@ -198,23 +237,49 @@ impl Netlist {
                 match comp {
                     Component::Resistor { n1, n2, r, .. } => {
                         let g = 1.0 / *r;
-                        if *n1 != 0 { let i = *n1 - 1; a[i][i] += g; }
-                        if *n2 != 0 { let j = *n2 - 1; a[j][j] += g; }
-                        if *n1 != 0 && *n2 != 0 { let i = *n1 - 1; let j = *n2 - 1; a[i][j] -= g; a[j][i] -= g; }
+                        if *n1 != 0 { let i = *n1 - 1; a_flat[i * n + i] += g; }
+                        if *n2 != 0 { let j = *n2 - 1; a_flat[j * n + j] += g; }
+                        if *n1 != 0 && *n2 != 0 { 
+                            let i = *n1 - 1; 
+                            let j = *n2 - 1; 
+                            a_flat[i * n + j] -= g; 
+                            a_flat[j * n + i] -= g; 
+                        }
                     }
                     Component::Memristor { n1, n2, mem, .. } => {
                         let s_guess = *mem_s_guess.get(&ci).unwrap_or(&mem.state());
                         let r_now = mem.resistance_for_state(s_guess);
                         let g = if r_now <= 0.0 { 0.0 } else { 1.0 / r_now };
-                        if *n1 != 0 { let i = *n1 - 1; a[i][i] += g; }
-                        if *n2 != 0 { let j = *n2 - 1; a[j][j] += g; }
-                        if *n1 != 0 && *n2 != 0 { let i = *n1 - 1; let j = *n2 - 1; a[i][j] -= g; a[j][i] -= g; }
+                        if *n1 != 0 { let i = *n1 - 1; a_flat[i * n + i] += g; }
+                        if *n2 != 0 { let j = *n2 - 1; a_flat[j * n + j] += g; }
+                        if *n1 != 0 && *n2 != 0 { 
+                            let i = *n1 - 1; 
+                            let j = *n2 - 1; 
+                            a_flat[i * n + j] -= g; 
+                            a_flat[j * n + i] -= g; 
+                        }
                     }
                     Component::Capacitor { id: _, n1, n2, c } => {
                         let g = *c / dt;
                         let vprev = *self.cap_vprev.get(&ci).unwrap_or(&0.0);
-                        if *n1 != 0 { let i = *n1 - 1; a[i][i] += g; if *n2 != 0 { let j = *n2 - 1; a[i][j] -= g; } b[*n1 - 1] += g * vprev; }
-                        if *n2 != 0 { let j = *n2 - 1; a[j][j] += g; if *n1 != 0 { let i = *n1 - 1; a[j][i] -= g; } b[*n2 - 1] -= g * vprev; }
+                        if *n1 != 0 { 
+                            let i = *n1 - 1; 
+                            a_flat[i * n + i] += g; 
+                            if *n2 != 0 { 
+                                let j = *n2 - 1; 
+                                a_flat[i * n + j] -= g; 
+                            } 
+                            b[i] += g * vprev; 
+                        }
+                        if *n2 != 0 { 
+                            let j = *n2 - 1; 
+                            a_flat[j * n + j] += g; 
+                            if *n1 != 0 { 
+                                let i = *n1 - 1; 
+                                a_flat[j * n + i] -= g; 
+                            } 
+                            b[j] -= g * vprev; 
+                        }
                     }
                     Component::CurrentSource { id: _, n_plus, n_minus, i } => {
                         if *n_plus != 0 { b[*n_plus - 1] -= *i; }
@@ -227,16 +292,22 @@ impl Netlist {
             for (k, &ci) in vs_map.iter().enumerate() {
                 let vs_col = n_var_nodes + k;
                 if let Component::VSource { n_plus, n_minus, kind, .. } = &self.comps[ci] {
-                    if *n_plus != 0 { let i = *n_plus - 1; a[i][vs_col] += 1.0; a[vs_col][i] += 1.0; }
-                    if *n_minus != 0 { let j = *n_minus - 1; a[j][vs_col] -= 1.0; a[vs_col][j] -= 1.0; }
+                    if *n_plus != 0 { 
+                        let i = *n_plus - 1; 
+                        a_flat[i * n + vs_col] += 1.0; 
+                        a_flat[vs_col * n + i] += 1.0; 
+                    }
+                    if *n_minus != 0 { 
+                        let j = *n_minus - 1; 
+                        a_flat[j * n + vs_col] -= 1.0; 
+                        a_flat[vs_col * n + j] -= 1.0; 
+                    }
                     b[vs_col] = kind.value_at(t);
                 }
             }
 
-            // flatten and solve linear system for this NR iteration
-            let mut flat = Vec::with_capacity(n * n);
-            for row in &a { for &v in row.iter() { flat.push(v); } }
-            let a_mat = DMatrix::from_row_slice(n, n, &flat);
+            // Create DMatrix directly from flat array
+            let a_mat = DMatrix::from_row_slice(n, n, &a_flat);
             let b_vec = DVector::from_row_slice(&b);
             let lu = LU::new(a_mat);
             let sol_vec_opt = lu.solve(&b_vec);

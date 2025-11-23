@@ -5,8 +5,18 @@ edition = "2021"
 
 [dependencies]
 nalgebra = "0.34"
-eframe = { version = "0.24", features = ["glow"] }
+eframe = { version = "0.27", features = ["glow", "wgpu"] }
 winapi = { version = "0.3", features = ["winuser", "windef"] }
 rfd = "0.11"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+three-d = { version = "0.18.2", optional = true }
+
+# Add wgpu for optional offscreen GPU renderer (compatible with eframe's resolved wgpu)
+wgpu = { version = "0.19", optional = true }
+pollster = { version = "0.3", optional = true }
+
+# ensure a compatible wgpu version is available for eframe's wgpu feature
+
+[features]
+gpu_view = ["three-d", "wgpu", "pollster"]
